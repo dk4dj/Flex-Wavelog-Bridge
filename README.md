@@ -1,35 +1,56 @@
 # FlexRadio → Wavelog Bridge
 
-Verbindet ein **FlexRadio 6600** mit **Wavelog** und überträgt Frequenz und Betriebsart automatisch.  
+Verbindet ein **FlexRadio 6600** (und kompatible Modelle) mit **Wavelog** und überträgt Frequenz und Betriebsart automatisch und in Echtzeit.
+
 Implementiert auf Basis der **FlexLib API v4.1.5** (FlexLib_API_v4.1.5.39794).
 
 ---
 
 ## Funktionen
 
-- **VITA-49 Discovery** – findet FlexRadio-Geräte via binärem UDP-Broadcast (Port 4992)
-- **SmartSDR TCP API** – verbindet sich auf Port 4992, empfängt Slice-Status-Updates
-- **Echtzeit-Übertragung** – sendet Frequenz & Betriebsart an Wavelog (`POST /api/radio`)
-- **System-Tray-Betrieb** – läuft im Hintergrund, Doppelklick öffnet das Fenster
-- **Konfigurierbares Intervall** – Standard 5 Sekunden, einstellbar 1–120 s
-- **Wavelog-Verbindungstest** – prüft API-Schlüssel und Erreichbarkeit
+- **Automatische Geräteerkennung** via VITA-49 UDP-Broadcast (Port 4992)
+- **SmartSDR TCP-API** – vollständige Implementierung des Kommando-Protokolls
+- **TX-Slice-Verfolgung** – sendet immer die Daten des aktiven Sende-Slice
+- **Manuelle Slice-Auswahl** – feste Auswahl unabhängig vom TX-Status
+- **Echtzeit-Übertragung** an Wavelog `POST /api/radio`, konfigurierbares Intervall (1–120 s)
+- **System-Tray-Betrieb** – läuft unsichtbar im Hintergrund, Doppelklick öffnet das Fenster
+- **Wavelog-Verbindungstest** – unabhängig vom FlexRadio, mit detaillierter Diagnose
+- **Persistente Konfiguration** unter `%APPDATA%\FlexWavelogBridge\config.json`
+- **Detailliertes Logging** in `%APPDATA%\FlexWavelogBridge\bridge.log`
 
 ---
 
 ## Voraussetzungen
 
-- Python 3.11+ (64-bit, Windows)
-- FlexRadio 6600 mit SmartSDR (lokales Netzwerk)
-- Wavelog-Instanz mit aktivem API-Schlüssel (Lesen + Schreiben)
+| Komponente | Anforderung |
+|---|---|
+| Betriebssystem | Windows 10/11 (64-bit) |
+| Python | 3.11 oder neuer – aus dem **Microsoft Store** |
+| FlexRadio | 6600 (oder anderes SmartSDR-kompatibles Gerät) |
+| SmartSDR | Muss aktiv laufen (für Discovery und TCP-Verbindung) |
+| Wavelog | Beliebige Version mit aktivem API-Schlüssel (Lesen + Schreiben) |
 
 ---
 
-## Installation & Start
+## Installation
 
-### Option 1: `start.bat` (empfohlen)
-Doppelklick auf `start.bat` – richtet automatisch virtuelle Umgebung ein.
+### Python über den Microsoft Store installieren
 
-### Option 2: Manuell
+1. **Start → Microsoft Store** öffnen
+2. Nach **"Python 3.12"** suchen und installieren
+3. Python ist dann direkt über `python` oder `python3` im Terminal verfügbar
+
+### Programm einrichten
+
+Alle Dateien in einen Ordner entpacken, dann `start.bat` doppelklicken.
+
+Das Skript:
+1. Sucht automatisch die Store-Python-Installation
+2. Erstellt eine virtuelle Umgebung im Unterordner `venv\`
+3. Installiert alle Abhängigkeiten (`PyQt6`, `requests`)
+4. Startet das Programm ohne Konsolenfenster (`pythonw`)
+
+**Manuell (alternativ):**
 ```bat
 python -m venv venv
 venv\Scripts\pip install -r requirements.txt
@@ -38,101 +59,93 @@ venv\Scripts\pythonw flex_wavelog_bridge.py
 
 ---
 
-## Protokoll-Details (FlexLib API v4.1.5)
+## Erste Schritte
 
-### Discovery (Discovery.cs + VitaDiscovery.cs)
-Das FlexRadio sendet **binäre VITA-49 UDP-Pakete** auf Port 4992:
+### 1. Wavelog konfigurieren
 
-| Offset | Bytes | Inhalt |
-|--------|-------|--------|
-| 0      | 4     | VITA-Header (pkt_type=0x7, C-Flag=1) |
-| 4      | 4     | Stream-ID |
-| 8      | 4     | OUI-Word (bits 23–0 = `0x001C2D`) |
-| 12     | 4     | ClassCode-Word (bits 15–0 = `0xFFFF`) |
-| 16+    | N     | UTF-8 Payload: `key=value`-Paare, leerzeichen-getrennt |
+Tab **Konfiguration** öffnen:
 
-Relevante Payload-Keys: `ip`, `model`, `nickname`, `version`, `status`, `serial`, `port`
+- **Wavelog URL** – z.B. `https://log.meinecall.de` (kein abschliessend `/`)
+- **API-Schlüssel** – in Wavelog unter *Benutzerkonto → API-Schlüssel* erstellen (Lesen + Schreiben)
+- **Funkgerät-Name** – beliebiger Name, erscheint so in Wavelog
+- **Update-Intervall** – Sendefrequenz an Wavelog (Standard: 5 s)
 
-### TCP-Verbindung (TcpCommandCommunication.cs + Radio.cs)
-- Port: **4992**
-- Framing: Zeilen, abgeschlossen mit `\n`
-- Kommandos senden: `C<seq>|<command>\n`
+Auf **"Einstellungen speichern"** klicken, dann **"Wavelog-Verbindung testen"**.
 
-**Initialisierungs-Sequenz** (Radio.cs ~Z. 1914–1965):
-```
-client program FlexWavelogBridge
-client start_persistence off
-sub client all
-sub tx all
-sub atu all
-sub slice all
-sub gps all
-```
+### 2. FlexRadio verbinden
 
-**Eingehende Nachrichten:**
-- `H<handle>|...`  → Client-Handle zugewiesen
-- `V<version>`     → Protokollversion
-- `S<handle>|<topic> [<idx>] <k>=<v> ...` → Status-Update
-- `R<seq>|<code>|<msg>` → Antwort auf Kommando
+Tab **Steuerung**:
 
-### Slice-Status (Slice.cs::StatusUpdate)
-Format: `S<handle>|slice <idx> <k>=<v> ...`
+1. **"Gerät suchen"** – sucht 4 Sekunden via UDP-Broadcast
+2. Gefundenes Gerät auswählen und **"Verbinden"** klicken
+3. Alternativ: IP-Adresse manuell eingeben (z.B. bei belegtem UDP-Port)
 
-| Key | Bedeutung |
-|-----|-----------|
-| `rf_frequency` | Frequenz in MHz (double, z.B. `14.225000`) |
-| `mode` | Betriebsart: `USB`, `LSB`, `AM`, `SAM`, `FM`, `NFM`, `DFM`, `CW`, `RTTY`, `DIGU`, `DIGL` |
-| `in_use` | `0` = Slice entfernt, `1` = aktiv |
-| `active` | Aktuell aktiver Slice |
+### 3. Slice-Auswahl
 
-### Modus-Mapping → ADIF/Wavelog
+Nach erfolgreicher Verbindung erscheinen alle offenen Slices in der Slice-Auswahl:
 
-| FlexRadio | Wavelog |
-|-----------|---------|
-| USB / LSB | SSB |
-| AM / SAM  | AM  |
-| FM / NFM / DFM | FM |
-| CW        | CW  |
-| RTTY      | RTTY |
-| DIGU / DIGL / FDV | DIGI |
+| Modus | Verhalten |
+|---|---|
+| Auto (TX-Slice) | Verfolgt automatisch den Slice mit `tx=1` |
+| Manuell wählen | Feste Auswahl eines Slice, unabhaengig vom TX-Status |
+
+Im Auto-Modus wird der erste (niedrigste) Slice als Fallback verwendet wenn kein TX-Slice aktiv ist.
 
 ---
 
-## Wavelog API
+## Autostart
 
-Endpunkt: `POST /api/radio` (Standard Radio API Call)
+1. `Win+R` → `shell:startup` eingeben
+2. Verknuepfung zu `start.bat` in den Autostart-Ordner legen
+3. In der App **"Beim Start automatisch verbinden"** aktivieren
 
-```json
-{
-  "key":       "IHR_API_SCHLUESSEL",
-  "radio":     "FlexRadio 6600",
-  "frequency": 14225000,
-  "mode":      "SSB",
-  "timestamp": "2025/01/15 14:30"
-}
+---
+
+## Dateien
+
+```
+flex_wavelog_bridge.py   Hauptprogramm
+requirements.txt         Python-Abhaengigkeiten (PyQt6, requests)
+start.bat                Starter-Skript fuer Windows
+README.md                Diese Datei
+CLAUDE.md                Technische Dokumentation fuer Entwickler
+```
+
+**Benutzerdaten** (werden automatisch angelegt):
+```
+%APPDATA%\FlexWavelogBridge\
+    config.json          Konfiguration
+    bridge.log           Detailliertes Log (DEBUG-Level)
 ```
 
 ---
 
-## Autostart (optional)
+## Modus-Mapping FlexRadio → ADIF/Wavelog
 
-1. `Win+R` → `shell:startup`
-2. Verknüpfung zu `start.bat` im Autostart-Ordner ablegen
-3. In der App: **"Beim Start automatisch verbinden"** aktivieren
+| FlexRadio-Mode | Wavelog/ADIF |
+|---|---|
+| USB, LSB | SSB |
+| AM, SAM | AM |
+| FM, NFM, DFM | FM |
+| CW | CW |
+| RTTY | RTTY |
+| DIGU, DIGL, FDV | DIGI |
 
----
-
-## Logdatei
-
-`%APPDATA%\FlexWavelogBridge\bridge.log`
+Unbekannte Modi werden unveraendert uebertragen.
 
 ---
 
 ## Fehlerbehebung
 
-| Problem | Lösung |
-|---------|--------|
-| Discovery findet kein Gerät | SmartSDR läuft? Firewall gibt UDP/4992 frei? IP manuell eingeben |
-| Port 4992 belegt | SmartSDR oder anderes Programm nutzt Port – direkte IP-Eingabe verwenden |
-| Wavelog-Fehler 401 | API-Schlüssel ungültig oder nur Lese-Berechtigung |
-| Modus wird falsch übertragen | Raw-Modus im Protokollfenster prüfen |
+| Problem | Ursache | Loesung |
+|---|---|---|
+| Discovery findet kein Geraet | SmartSDR nicht aktiv, UDP/4992 geblockt | SmartSDR starten; Firewall pruefen; IP manuell eingeben |
+| Port nicht verfuegbar | Anderes Programm belegt UDP/4992 | IP manuell im Dialog eingeben |
+| Verbindung abgelehnt | SmartSDR laeuft nicht / falsche IP | SmartSDR-Status und IP pruefen |
+| Timeout | Anderes Subnetz / VPN / Firewall | Erreichbarkeit mit `ping` pruefen |
+| Wavelog 401 | API-Schluessel ungueltig oder zu wenig Rechte | Neuen Schluessel mit Lesen+Schreiben erstellen |
+| Wavelog 404 | URL falsch | URL mit `/index.php/` testen |
+| Wavelog 302 | HTTP/HTTPS verwechselt | `https://` statt `http://` (oder umgekehrt) |
+| Kein Slice sichtbar | Slice in SmartSDR nicht geoeffnet | Mindestens einen Slice in SmartSDR oeffnen |
+| Falscher Slice | Kein TX-Slice aktiv | TX in SmartSDR aktivieren oder Manuell-Modus nutzen |
+| Programm nicht sichtbar | `pythonw` startet ohne Fenster | System-Tray pruefen (Pfeil neben der Uhr) |
