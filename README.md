@@ -1,57 +1,63 @@
 # FlexRadio → Wavelog Bridge
 
-Verbindet ein **FlexRadio 6600** (und kompatible Modelle) mit **Wavelog** und überträgt Frequenz und Betriebsart automatisch und in Echtzeit.
+Connects a **FlexRadio 6600** (and compatible models) to **Wavelog**, transmitting frequency, mode, and TX power in real time and fully automatically.
 
-Implementiert auf Basis der **FlexLib API v4.1.5** (FlexLib_API_v4.1.5.39794).
-
----
-
-## Funktionen
-
-- **Automatische Geräteerkennung** via VITA-49 UDP-Broadcast (Port 4992)
-- **SmartSDR TCP-API** – vollständige Implementierung des Kommando-Protokolls
-- **TX-Slice-Verfolgung** – sendet immer die Daten des aktiven Sende-Slice
-- **Manuelle Slice-Auswahl** – feste Auswahl unabhängig vom TX-Status
-- **Echtzeit-Übertragung** an Wavelog `POST /api/radio`, konfigurierbares Intervall (1–120 s)
-- **System-Tray-Betrieb** – läuft unsichtbar im Hintergrund, Doppelklick öffnet das Fenster
-- **Wavelog-Verbindungstest** – unabhängig vom FlexRadio, mit detaillierter Diagnose
-- **Persistente Konfiguration** unter `%APPDATA%\FlexWavelogBridge\config.json`
-- **Detailliertes Logging** in `%APPDATA%\FlexWavelogBridge\bridge.log`
+Implemented based on the **FlexLib API v4.1.5** (FlexLib_API_v4.1.5.39794).
 
 ---
 
-## Voraussetzungen
+## Features
 
-| Komponente | Anforderung |
-|---|---|
-| Betriebssystem | Windows 10/11 (64-bit) |
-| Python | 3.11 oder neuer – aus dem **Microsoft Store** |
-| FlexRadio | 6600 (oder anderes SmartSDR-kompatibles Gerät) |
-| SmartSDR | Muss aktiv laufen (für Discovery und TCP-Verbindung) |
-| Wavelog | Beliebige Version mit aktivem API-Schlüssel (Lesen + Schreiben) |
+- **Automatic device discovery** via VITA-49 UDP broadcast (port 4992) with last-used radio pre-selected
+- **SmartSDR TCP API** – complete implementation of the command protocol
+- **TX slice tracking** – always transmits data from the active transmit slice
+- **Manual slice selection** – fixed selection independent of TX status
+- **Real-time transmission** to Wavelog `POST /api/radio`, configurable interval (1–120 s)
+- **TX power reporting** – reads RF output power from the radio and sends it to Wavelog as `power` (watts)
+- **Auto-reconnect for FlexRadio** – automatically reconnects after connection loss, configurable interval
+- **Auto-retry for Wavelog** – keeps retrying silently when Wavelog is temporarily unreachable
+- **System tray operation** – runs invisibly in the background; double-click reopens the window
+- **Quit button** – dedicated button in the UI to fully exit the program (closing the window minimises to tray)
+- **Wavelog connection test** – independent of FlexRadio, with detailed diagnostics
+- **Persistent configuration** stored in `%APPDATA%\FlexWavelogBridge\config.json`
+- **Detailed logging** in `%APPDATA%\FlexWavelogBridge\bridge.log`
+
+---
+
+## Requirements
+
+| Component | Requirement |
+|-----------|-------------|
+| Operating System | Windows 10/11 (64-bit) |
+| Python | 3.11 or newer – from the **Microsoft Store** |
+| FlexRadio | 6600 (or any other SmartSDR-compatible device) |
+| SmartSDR | Must be running (required for discovery and TCP connection) |
+| Wavelog | Any version with an active API key (Read + Write) |
 
 ---
 
 ## Installation
 
-### Python über den Microsoft Store installieren
+### Install Python from the Microsoft Store
 
-1. **Start → Microsoft Store** öffnen
-2. Nach **"Python 3.12"** suchen und installieren
-3. Python ist dann direkt über `python` oder `python3` im Terminal verfügbar
+1. Open **Start → Microsoft Store**
+2. Search for **"Python 3.12"** and install it
+3. Python is then available as `python` or `python3` in the terminal
 
-### Programm einrichten
+### Set up the program
 
-Alle Dateien in einen Ordner entpacken, dann `start.bat` doppelklicken.
+Extract all files into a folder, then double-click `start.bat`.
 
-Das Skript:
-1. Sucht automatisch die Store-Python-Installation
-2. Erstellt eine virtuelle Umgebung im Unterordner `venv\`
-3. Installiert alle Abhängigkeiten (`PyQt6`, `requests`)
-4. Startet das Programm ohne Konsolenfenster (`pythonw`)
+The script will:
 
-**Manuell (alternativ):**
-```bat
+1. Automatically locate the Store Python installation
+2. Create a virtual environment in the `venv\` subfolder
+3. Install all dependencies (`PyQt6`, `requests`)
+4. Launch the program without a console window (`pythonw`)
+
+**Manual alternative:**
+
+```
 python -m venv venv
 venv\Scripts\pip install -r requirements.txt
 venv\Scripts\pythonw flex_wavelog_bridge.py
@@ -59,71 +65,94 @@ venv\Scripts\pythonw flex_wavelog_bridge.py
 
 ---
 
-## Erste Schritte
+## Getting Started
 
-### 1. Wavelog konfigurieren
+### 1. Configure Wavelog
 
-Tab **Konfiguration** öffnen:
+Open the **Configuration** tab:
 
-- **Wavelog URL** – z.B. `https://log.meinecall.de` (kein abschliessend `/`)
-- **API-Schlüssel** – in Wavelog unter *Benutzerkonto → API-Schlüssel* erstellen (Lesen + Schreiben)
-- **Funkgerät-Name** – beliebiger Name, erscheint so in Wavelog
-- **Update-Intervall** – Sendefrequenz an Wavelog (Standard: 5 s)
+- **Wavelog URL** – e.g. `https://log.mycall.com` (no trailing `/`)
+- **API Key** – create one in Wavelog under *User Account → API Keys* (Read + Write)
+- **Radio Name** – any name; this is how it appears in Wavelog
+- **Update Interval** – how often data is sent to Wavelog (default: 5 s)
 
-Auf **"Einstellungen speichern"** klicken, dann **"Wavelog-Verbindung testen"**.
+Click **"Save Settings"**, then **"Test Wavelog Connection"**.
 
-### 2. FlexRadio verbinden
+### 2. Connect FlexRadio
 
-Tab **Steuerung**:
+Go to the **Control** tab:
 
-1. **"Gerät suchen"** – sucht 4 Sekunden via UDP-Broadcast
-2. Gefundenes Gerät auswählen und **"Verbinden"** klicken
-3. Alternativ: IP-Adresse manuell eingeben (z.B. bei belegtem UDP-Port)
+1. Click **"Search Device"** – listens for 4 seconds via UDP broadcast
+   - The last used radio is automatically pre-selected in the list
+2. Select the found device and click **"Connect"**
+3. Alternatively: enter the IP address manually (e.g. if UDP port 4992 is already in use)
 
-### 3. Slice-Auswahl
+### 3. Auto-Reconnect
 
-Nach erfolgreicher Verbindung erscheinen alle offenen Slices in der Slice-Auswahl:
+Enable **"Automatically reconnect on connection loss"** in the Control tab.  
+Configure the reconnect interval (5–300 s). When SmartSDR is closed or the network drops, the bridge will reconnect automatically as soon as SmartSDR is available again.
 
-| Modus | Verhalten |
-|---|---|
-| Auto (TX-Slice) | Verfolgt automatisch den Slice mit `tx=1` |
-| Manuell wählen | Feste Auswahl eines Slice, unabhaengig vom TX-Status |
+### 4. Slice Selection
 
-Im Auto-Modus wird der erste (niedrigste) Slice als Fallback verwendet wenn kein TX-Slice aktiv ist.
+After a successful connection, all open slices appear in the slice selector:
+
+| Mode | Behaviour |
+|------|-----------|
+| Auto (TX Slice) | Automatically follows the slice with `tx=1` |
+| Manual | Fixed selection of a slice, regardless of TX status |
+
+In Auto mode, the lowest-numbered slice is used as fallback when no TX slice is active.
+
+### 5. TX Power
+
+The bridge reads the `rfpower` value (0–100) from the FlexRadio transmit status and forwards it as `power` (integer, watts) to the Wavelog API. The current value is shown in the orange indicator in the status bar. Power is only sent when the value is greater than 0.
+
+---
+
+## Closing vs. Quitting
+
+| Action | Result |
+|--------|--------|
+| Click **✕** in the window title bar | Minimises to system tray – bridge keeps running |
+| Click **✕ Quit** button in the header | Fully terminates the program |
+| Tray menu → **Quit** | Fully terminates the program |
+
+A tray notification reminds you when the window is minimised to the tray.
 
 ---
 
 ## Autostart
 
-1. `Win+R` → `shell:startup` eingeben
-2. Verknuepfung zu `start.bat` in den Autostart-Ordner legen
-3. In der App **"Beim Start automatisch verbinden"** aktivieren
+1. Press `Win+R` → type `shell:startup`
+2. Place a shortcut to `start.bat` in the startup folder
+3. Enable **"Automatically connect on startup"** in the app
 
 ---
 
-## Dateien
+## Files
 
 ```
-flex_wavelog_bridge.py   Hauptprogramm
-requirements.txt         Python-Abhaengigkeiten (PyQt6, requests)
-start.bat                Starter-Skript fuer Windows
-README.md                Diese Datei
-CLAUDE.md                Technische Dokumentation fuer Entwickler
+flex_wavelog_bridge.py   Main program
+requirements.txt         Python dependencies (PyQt6, requests)
+start.bat                Windows launcher script
+README.md                This file
+CLAUDE.md                Technical documentation for developers
 ```
 
-**Benutzerdaten** (werden automatisch angelegt):
+**User data** (created automatically):
+
 ```
 %APPDATA%\FlexWavelogBridge\
-    config.json          Konfiguration
-    bridge.log           Detailliertes Log (DEBUG-Level)
+    config.json          Configuration
+    bridge.log           Detailed log (DEBUG level)
 ```
 
 ---
 
-## Modus-Mapping FlexRadio → ADIF/Wavelog
+## Mode Mapping: FlexRadio → ADIF / Wavelog
 
-| FlexRadio-Mode | Wavelog/ADIF |
-|---|---|
+| FlexRadio Mode | Wavelog / ADIF |
+|----------------|----------------|
 | USB, LSB | SSB |
 | AM, SAM | AM |
 | FM, NFM, DFM | FM |
@@ -131,21 +160,58 @@ CLAUDE.md                Technische Dokumentation fuer Entwickler
 | RTTY | RTTY |
 | DIGU, DIGL, FDV | DIGI |
 
-Unbekannte Modi werden unveraendert uebertragen.
+Unknown modes are passed through unchanged.
 
 ---
 
-## Fehlerbehebung
+## Troubleshooting
 
-| Problem | Ursache | Loesung |
-|---|---|---|
-| Discovery findet kein Geraet | SmartSDR nicht aktiv, UDP/4992 geblockt | SmartSDR starten; Firewall pruefen; IP manuell eingeben |
-| Port nicht verfuegbar | Anderes Programm belegt UDP/4992 | IP manuell im Dialog eingeben |
-| Verbindung abgelehnt | SmartSDR laeuft nicht / falsche IP | SmartSDR-Status und IP pruefen |
-| Timeout | Anderes Subnetz / VPN / Firewall | Erreichbarkeit mit `ping` pruefen |
-| Wavelog 401 | API-Schluessel ungueltig oder zu wenig Rechte | Neuen Schluessel mit Lesen+Schreiben erstellen |
-| Wavelog 404 | URL falsch | URL mit `/index.php/` testen |
-| Wavelog 302 | HTTP/HTTPS verwechselt | `https://` statt `http://` (oder umgekehrt) |
-| Kein Slice sichtbar | Slice in SmartSDR nicht geoeffnet | Mindestens einen Slice in SmartSDR oeffnen |
-| Falscher Slice | Kein TX-Slice aktiv | TX in SmartSDR aktivieren oder Manuell-Modus nutzen |
-| Programm nicht sichtbar | `pythonw` startet ohne Fenster | System-Tray pruefen (Pfeil neben der Uhr) |
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| Discovery finds no device | SmartSDR not running, UDP/4992 blocked | Start SmartSDR; check firewall; enter IP manually |
+| Port not available | Another program is using UDP/4992 | Enter IP manually in the dialog |
+| Connection refused | SmartSDR not running / wrong IP | Check SmartSDR status and IP address |
+| Timeout | Different subnet / VPN / firewall | Check reachability with `ping` |
+| Wavelog 401 | API key invalid or insufficient permissions | Create a new key with Read + Write |
+| Wavelog 404 | Wrong URL | Try the URL with `/index.php/` |
+| Wavelog 302 | HTTP/HTTPS mismatch | Use `https://` instead of `http://` (or vice versa) |
+| No slice visible | No slice opened in SmartSDR | Open at least one slice in SmartSDR |
+| Wrong slice | No TX slice active | Activate TX in SmartSDR or use Manual mode |
+| Program not visible | `pythonw` starts without a window | Check the system tray (arrow next to the clock) |
+| No power value shown | Radio not transmitting or `sub transmit` not supported | Value only appears during active TX |
+
+---
+
+## Changelog
+
+### v2.0 (2025)
+- **New:** Last used radio pre-selected in discovery dialog
+- **New:** Automatic FlexRadio reconnect with configurable interval
+- **New:** Wavelog retry counter with periodic status messages
+- **New:** Dedicated "Quit" button in the UI header and tray menu
+- **New:** TX power (RF power in watts) read from radio and sent to Wavelog
+- **Bugfix:** Bridge no longer sends stale data to Wavelog after SmartSDR is closed
+
+### v1.0 (2025)
+- Initial release
+
+---
+
+## About This Project
+
+This project was developed with the assistance of **[Claude](https://claude.ai)**, an AI assistant made by [Anthropic](https://www.anthropic.com). Claude helped design the architecture, implement the FlexLib API communication, write the PyQt6 UI, and iteratively debug and extend the feature set.
+
+---
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
+
+You are free to use, modify, and distribute this software under the terms of the GPL v3. Any derivative works must also be released under the same license.
+
+See the [LICENSE](LICENSE) file for the full license text, or visit  
+https://www.gnu.org/licenses/gpl-3.0.html
+
+---
+
+*73 de DK4DJ*
