@@ -1,8 +1,16 @@
 """
 FlexRadio 6600 → Wavelog Bridge – FlexLib API v4.1.5
 
-Bugfix: UpdateWorker sendet keine Daten mehr an Wavelog, nachdem SmartSDR
-        beendet wurde. Bei Verbindungstrennung wird _current_data geleert.
+Änderungen gegenüber der Ursprungsversion
+──────────────────────────────────────────
+BUGFIX  : UpdateWorker stoppt Senden an Wavelog sobald SmartSDR getrennt wird.
+NEU  1  : Discovery-Dialog merkt sich das zuletzt benutzte Gerät und wählt es vor.
+NEU  2a : Automatischer Reconnect für FlexRadio (konfigurierbares Intervall).
+NEU  2b : Automatischer Reconnect / Retry-Hinweis für Wavelog bei Fehler.
+NEU  3  : „Beenden"-Button im GUI – beendet das Programm vollständig.
+          Normales Schließen des Fensters schickt es weiterhin in den Tray.
+NEU  4  : Sendeleistung (RF-Power in Watt) wird vom FlexRadio ausgelesen
+          und als „power\" an die Wavelog-API übermittelt.
 """
 
 import sys, os, json, socket, struct, threading, time, logging, datetime, requests
@@ -18,16 +26,12 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, pyqtSlot
 from PyQt6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QAction
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-# IMPORTANT: pythonw.exe sets sys.stdout = None → never pass sys.stdout to a
-# StreamHandler or any log.xxx call that might reach it from a signal slot.
-
 LOG_DIR = Path(os.environ.get("APPDATA", ".")) / "FlexWavelogBridge"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "bridge.log"
 
-# File-only logger – safe under pythonw.exe (no stdout)
 _log_handlers: list = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
-if sys.stdout is not None:   # console only when stdout actually exists
+if sys.stdout is not None:
     _log_handlers.append(logging.StreamHandler(sys.stdout))
 
 logging.basicConfig(
@@ -43,13 +47,18 @@ CONFIG_FILE = LOG_DIR / "config.json"
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 DEFAULT_CONFIG = {
-    "wavelog_url":      "",
-    "wavelog_api_key":  "",
-    "radio_name":       "FlexRadio 6600",
-    "update_interval":  5,
-    "flex_host":        "",
-    "flex_port":        4992,
-    "auto_connect":     False,
+    "wavelog_url":        "",
+    "wavelog_api_key":    "",
+    "radio_name":         "FlexRadio 6600",
+    "update_interval":    5,
+    "flex_host":          "",
+    "flex_port":          4992,
+    "auto_connect":       False,
+    # NEU 2a – Reconnect
+    "flex_reconnect":     True,
+    "flex_reconnect_sec": 15,
+    # NEU 1 – letztes bekanntes Gerät (IP gespeichert für Vorauswahl)
+    "last_flex_ip":       "",
 }
 
 def load_config() -> dict:
@@ -72,14 +81,11 @@ def save_config(cfg: dict) -> None:
         log.error(f"Config speichern fehlgeschlagen: {e}")
 
 # ─── VITA-49 Discovery ────────────────────────────────────────────────────────
-# VitaDiscovery.cs + VitaFlex.cs (FlexLib v4.1.5)
-# UDP port 4992, binary VITA-49 packets.
-# OUI=0x001C2D, PacketClassCode=0xFFFF
 
-FLEX_OUI                   = 0x001C2D
-VITA_EXT_DATA_WITH_STREAM  = 0x7
-SL_VITA_DISCOVERY_CLASS    = 0xFFFF
-DISCOVERY_PORT             = 4992
+FLEX_OUI                  = 0x001C2D
+VITA_EXT_DATA_WITH_STREAM = 0x7
+SL_VITA_DISCOVERY_CLASS   = 0xFFFF
+DISCOVERY_PORT            = 4992
 
 def _parse_vita_discovery(data: bytes, src_ip: str) -> dict | None:
     if len(data) < 16:
@@ -95,9 +101,9 @@ def _parse_vita_discovery(data: bytes, src_ip: str) -> dict | None:
     if pkt_type != VITA_EXT_DATA_WITH_STREAM or not has_cls:
         return None
 
-    idx  = 8   # skip stream_id (4) already past header (4)
-    oui  = struct.unpack_from(">I", data, idx)[0] & 0x00FFFFFF;  idx += 4
-    pcc  = struct.unpack_from(">I", data, idx)[0] & 0xFFFF;      idx += 4
+    idx = 8
+    oui = struct.unpack_from(">I", data, idx)[0] & 0x00FFFFFF;  idx += 4
+    pcc = struct.unpack_from(">I", data, idx)[0] & 0xFFFF;      idx += 4
 
     if oui != FLEX_OUI or pcc != SL_VITA_DISCOVERY_CLASS:
         return None
@@ -105,9 +111,9 @@ def _parse_vita_discovery(data: bytes, src_ip: str) -> dict | None:
     if tsi: idx += 4
     if tsf: idx += 8
 
-    total_bytes  = pkt_size * 4
-    payload_end  = total_bytes - (4 if has_trl else 0)
-    payload_len  = payload_end - idx
+    total_bytes = pkt_size * 4
+    payload_end = total_bytes - (4 if has_trl else 0)
+    payload_len = payload_end - idx
 
     if payload_len <= 0 or idx + payload_len > len(data):
         return None
@@ -119,7 +125,6 @@ def _parse_vita_discovery(data: bytes, src_ip: str) -> dict | None:
         if k and v:
             result[k.lower()] = v
     result.setdefault("nickname", result.get("model", "FlexRadio"))
-    log.debug(f"VITA discovery from {src_ip}: {result.get('nickname')} model={result.get('model')}")
     return result
 
 
@@ -146,8 +151,7 @@ class FlexDiscovery:
                         data, addr = sock.recvfrom(4096)
                         info = _parse_vita_discovery(data, addr[0])
                         if info:
-                            key        = info.get("ip", addr[0])
-                            found[key] = info
+                            found[info.get("ip", addr[0])] = info
                     except socket.timeout:
                         continue
                     except Exception as e:
@@ -165,69 +169,59 @@ class FlexDiscovery:
 
 
 # ─── FlexRadio TCP Client ─────────────────────────────────────────────────────
-# TcpCommandCommunication.cs + Radio.cs + Slice.cs (FlexLib v4.1.5)
-# Port 4992, line-delimited \n.
-# Slice status keys: rf_frequency (MHz double), mode (str), tx (0|1)
 
 class FlexRadioClient(QThread):
-    # All signals use simple, PyQt6-safe types (str / list, not nested dict)
-    status_changed = pyqtSignal(str)   # "connected" | "disconnected" | "error:..."
-    radio_data     = pyqtSignal(str)   # JSON string – avoids pyqtSignal(dict) issues
-    log_message    = pyqtSignal(str)   # plain text for GUI log
-    slices_changed = pyqtSignal(str)   # JSON string of slice snapshot
+    status_changed = pyqtSignal(str)   # "connected" | "disconnected"
+    radio_data     = pyqtSignal(str)   # JSON
+    log_message    = pyqtSignal(str)
+    slices_changed = pyqtSignal(str)   # JSON snapshot
 
     MODE_MAP = {
-        "USB":"SSB", "LSB":"SSB",
-        "AM":"AM",   "SAM":"AM",
-        "FM":"FM",   "NFM":"FM",  "DFM":"FM",
-        "CW":"CW",   "RTTY":"RTTY",
-        "DIGU":"DIGI","DIGL":"DIGI","FDV":"DIGI",
+        "USB": "SSB", "LSB": "SSB",
+        "AM":  "AM",  "SAM": "AM",
+        "FM":  "FM",  "NFM": "FM",  "DFM": "FM",
+        "CW":  "CW",  "RTTY": "RTTY",
+        "DIGU": "DIGI", "DIGL": "DIGI", "FDV": "DIGI",
     }
 
     def __init__(self, host: str, port: int = 4992):
         super().__init__()
-        self.host            = host
-        self.port            = port
-        self._run            = False
-        self._sock           = None
-        self._seq            = 1
-        self._slices: dict[str, dict] = {}   # idx → {rf_frequency, mode, tx}
-        self._handle         = ""
-        # None = auto (TX slice), str = manual pin
+        self.host   = host
+        self.port   = port
+        self._run   = False
+        self._sock  = None
+        self._seq   = 1
+        self._slices: dict[str, dict] = {}
+        self._handle = ""
         self.selected_slice: str | None = None
+        # NEU 4 – Sendeleistung: global pro Radio (nicht pro Slice)
+        self._rf_power_w: float = 0.0
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
-    # Windows socket error codes that mean "socket was closed intentionally"
-    _CLOSED_ERRNOS = {
-        10038,   # WSAENOTSOCK – socket closed externally via stop()
-        10054,   # WSAECONNRESET
-        10053,   # WSAECONNABORTED
-        9,       # EBADF (Linux equivalent)
-    }
+    _CLOSED_ERRNOS = {10038, 10054, 10053, 9}
 
     def run(self) -> None:
         self._run = True
-        log.info(f"FlexRadioClient thread start: {self.host}:{self.port}")
-        connect_error: str | None = None   # set only for real, unexpected errors
+        log.info(f"FlexRadioClient start: {self.host}:{self.port}")
+        connect_error: str | None = None
 
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._sock.settimeout(10)
-            log.info(f"TCP connect → {self.host}:{self.port}")
             self._sock.connect((self.host, self.port))
             self._sock.settimeout(1.5)
             self.status_changed.emit("connected")
             self.log_message.emit(f"✓ TCP verbunden: {self.host}:{self.port}")
-            log.info(f"TCP connected to {self.host}:{self.port}")
+            log.info(f"TCP connected: {self.host}:{self.port}")
 
-            # Init sequence (Radio.cs ~L1914-1965)
             for cmd in ("client program FlexWavelogBridge",
                         "client start_persistence off",
                         "sub client all",
                         "sub tx all",
                         "sub atu all",
                         "sub slice all",
-                        "sub gps all"):
+                        "sub gps all",
+                        # NEU 4 – Transmit-Status (enthält rf_power_available / pwr)
+                        "sub transmit all"):
                 self._cmd(cmd)
 
             buf = ""
@@ -242,15 +236,14 @@ class FlexRadioClient(QThread):
                         line, buf = buf.split("\n", 1)
                         line = line.strip("\r\0")
                         if line:
-                            log.debug(f"RX: {line[:140]}")
+                            log.debug(f"RX: {line[:160]}")
                             self._parse_line(line)
                 except socket.timeout:
                     self._cmd("ping")
                 except OSError as e:
                     winerr = getattr(e, "winerror", None) or e.errno
                     if winerr in self._CLOSED_ERRNOS or not self._run:
-                        # Normal shutdown – socket was closed by stop()
-                        log.info(f"FlexRadio: Socket geschlossen (erwartet, winerr={winerr})")
+                        log.info(f"FlexRadio: Socket geschlossen (winerr={winerr})")
                     else:
                         log.warning(f"FlexRadio recv OSError: {e}")
                         connect_error = str(e)
@@ -258,33 +251,23 @@ class FlexRadioClient(QThread):
 
         except ConnectionRefusedError:
             connect_error = f"Verbindung abgelehnt – kein FlexRadio unter {self.host}:{self.port}"
-            log.warning(f"FlexRadio: {connect_error}")
         except socket.timeout:
             connect_error = f"Timeout – {self.host}:{self.port} nicht erreichbar (10 s)"
-            log.warning(f"FlexRadio: {connect_error}")
         except OSError as e:
             winerr = getattr(e, "winerror", None) or e.errno
-            if winerr in self._CLOSED_ERRNOS or not self._run:
-                # stop() was called before/during connect – completely normal
-                log.info(f"FlexRadio: Verbindungsaufbau durch stop() abgebrochen")
-            else:
+            if not (winerr in self._CLOSED_ERRNOS or not self._run):
                 connect_error = str(e)
-                log.error(f"FlexRadio OSError beim Verbinden: {e}", exc_info=True)
+                log.error(f"FlexRadio OSError: {e}", exc_info=True)
         except Exception as e:
             connect_error = str(e)
             log.error(f"FlexRadio unerwarteter Fehler: {e}", exc_info=True)
-
         finally:
-            # Close socket safely – may already be closed by stop()
             sock, self._sock = self._sock, None
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+            if sock:
+                try: sock.close()
+                except Exception: pass
 
         log.info("FlexRadioClient thread ending")
-        # Only show an error message if it was a real problem
         if connect_error:
             self.log_message.emit(f"✗ {connect_error}")
         self.status_changed.emit("disconnected")
@@ -294,8 +277,7 @@ class FlexRadioClient(QThread):
         if not self._sock:
             return
         try:
-            msg = f"C{self._seq}|{command}\n"
-            self._sock.sendall(msg.encode("utf-8"))
+            self._sock.sendall(f"C{self._seq}|{command}\n".encode("utf-8"))
             self._seq += 1
             log.debug(f"TX: {command}")
         except Exception as e:
@@ -308,15 +290,10 @@ class FlexRadioClient(QThread):
             return
         ch = line[0]
         if ch == 'H':
-            # H<handle>|...
             self._handle = line[1:].split("|")[0]
-            msg = f"Client-Handle: 0x{self._handle}"
-            log.info(f"FlexRadio: {msg}")
-            self.log_message.emit(msg)
+            self.log_message.emit(f"Client-Handle: 0x{self._handle}")
         elif ch == 'V':
-            ver = line[1:]
-            log.info(f"FlexRadio Protokollversion: {ver}")
-            self.log_message.emit(f"Protokoll-Version: {ver}")
+            self.log_message.emit(f"Protokoll-Version: {line[1:]}")
         elif ch == 'S':
             self._parse_status(line)
         elif ch == 'M':
@@ -325,7 +302,6 @@ class FlexRadioClient(QThread):
                 log.info(f"FlexRadio Meldung: {parts[1]}")
 
     def _parse_status(self, line: str) -> None:
-        # S<handle>|<topic> [<idx>] <k>=<v> ...
         parts = line.split("|", 1)
         if len(parts) < 2:
             return
@@ -334,6 +310,7 @@ class FlexRadioClient(QThread):
         if not words:
             return
         topic = words[0].lower()
+
         if topic == "slice":
             if len(words) < 3:
                 return
@@ -344,8 +321,32 @@ class FlexRadioClient(QThread):
                     log.info(f"Slice {idx} entfernt")
                     self._emit_slices()
                 return
-            update_str = body[len("slice ") + len(idx) + 1:]
-            self._update_slice(idx, update_str)
+            self._update_slice(idx, body[len("slice ") + len(idx) + 1:])
+
+        # NEU 4 – Transmit-Status: enthält key "rfpower" (0-100, Prozent der max. Leistung)
+        # und "tune_power" sowie senden wir "power" in Watt über das Slice-Objekt weiter.
+        # Das FlexRadio sendet: "S<handle>|transmit rfpower=<0-100> ..."
+        # rfpower ist ein Prozentwert (0-100) relativ zur maximalen Ausgangsleistung des Radios.
+        # Da die Maximalleistung modellabhängig ist, senden wir den Rohwert (0-100 W entspricht
+        # bei einem 100-W-Radio 1:1 in Watt, bei einem 10-W-Radio x0.1).
+        # Wavelog akzeptiert "power" als Integer in Watt; wir übergeben den Wert direkt (0-100).
+        elif topic == "transmit":
+            changed = False
+            for kv in words[1:]:
+                if "=" not in kv:
+                    continue
+                k, _, v = kv.partition("=")
+                if k.lower() == "rfpower":
+                    try:
+                        new_pwr = float(v)
+                        if new_pwr != self._rf_power_w:
+                            self._rf_power_w = new_pwr
+                            changed = True
+                            log.debug(f"RF-Power: {self._rf_power_w:.0f} W")
+                    except ValueError:
+                        pass
+            if changed:
+                self._emit_active_slice_data()
 
     def _update_slice(self, idx: str, update: str) -> None:
         is_new = idx not in self._slices
@@ -382,72 +383,67 @@ class FlexRadioClient(QThread):
                     changed = True
                     log.info(f"Slice {idx}: tx={'JA' if new_tx else 'NEIN'}")
                     if new_tx:
-                        for other_idx, other_s in self._slices.items():
-                            if other_idx != idx and other_s.get("tx"):
-                                other_s["tx"] = False
-                                log.debug(f"Slice {other_idx}: tx zurückgesetzt")
+                        for oi, os_ in self._slices.items():
+                            if oi != idx and os_.get("tx"):
+                                os_["tx"] = False
 
         if changed:
             self._emit_slices()
 
-        # Only emit radio_data for the currently active slice
         active = self._active_slice_idx()
-        if active != idx:
-            return
+        if active == idx:
+            self._emit_active_slice_data(idx)
 
+    def _emit_active_slice_data(self, force_idx: str | None = None) -> None:
+        """Emit radio_data for the currently active slice."""
+        idx = force_idx if force_idx is not None else self._active_slice_idx()
+        if idx is None or idx not in self._slices:
+            return
+        s        = self._slices[idx]
         freq_mhz = s.get("rf_frequency")
         mode_raw = s.get("mode", "")
-        if freq_mhz and mode_raw:
-            freq_hz      = int(freq_mhz * 1_000_000)
-            wavelog_mode = self.MODE_MAP.get(mode_raw, mode_raw)
-            mode_label   = "TX-AUTO" if self.selected_slice is None else "MANUELL"
-            log.info(f"Slice {idx} [{mode_label}]: {freq_mhz:.3f} MHz "
-                     f"mode={mode_raw}→{wavelog_mode} tx={s.get('tx')}")
-            # Emit as JSON string to avoid pyqtSignal(dict) issues
-            payload = json.dumps({
-                "frequency": freq_hz,
-                "mode":      wavelog_mode,
-                "raw_mode":  mode_raw,
-                "freq_mhz":  freq_mhz,
-                "slice":     idx,
-                "tx":        s.get("tx", False),
-            })
-            self.radio_data.emit(payload)
+        if not freq_mhz or not mode_raw:
+            return
+        freq_hz      = int(freq_mhz * 1_000_000)
+        wavelog_mode = self.MODE_MAP.get(mode_raw, mode_raw)
+        mode_label   = "TX-AUTO" if self.selected_slice is None else "MANUELL"
+        log.info(f"Slice {idx} [{mode_label}]: {freq_mhz:.3f} MHz "
+                 f"mode={mode_raw}→{wavelog_mode} tx={s.get('tx')} "
+                 f"pwr={self._rf_power_w:.0f}W")
+        payload = json.dumps({
+            "frequency": freq_hz,
+            "mode":      wavelog_mode,
+            "raw_mode":  mode_raw,
+            "freq_mhz":  freq_mhz,
+            "slice":     idx,
+            "tx":        s.get("tx", False),
+            # NEU 4
+            "power_w":   self._rf_power_w,
+        })
+        self.radio_data.emit(payload)
 
     def _active_slice_idx(self) -> str | None:
-        """Which slice index should currently be reported to Wavelog?"""
         if self.selected_slice is not None:
             return self.selected_slice if self.selected_slice in self._slices else None
-        # Auto: TX slice
         for idx, s in self._slices.items():
             if s.get("tx"):
                 return idx
-        # Fallback: numerically lowest
         if self._slices:
             return min(self._slices.keys(), key=lambda x: int(x) if x.isdigit() else 99)
         return None
 
     def _emit_slices(self) -> None:
-        """Emit slice snapshot as JSON string (safe for cross-thread signals)."""
         try:
             self.slices_changed.emit(json.dumps(self._slices))
         except Exception as e:
             log.debug(f"slices_changed emit error: {e}")
 
     def stop(self) -> None:
-        """Signal the run loop to exit and close the socket.
-
-        Closing the socket from the outside thread unblocks recv() immediately.
-        The resulting OSError (WinError 10038 / EBADF) is caught and ignored
-        inside run() because _run will be False at that point.
-        """
         self._run = False
-        sock, self._sock = self._sock, None   # take ownership atomically
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
+        sock, self._sock = self._sock, None
+        if sock:
+            try: sock.close()
+            except Exception: pass
 
 
 # ─── Wavelog API Client ────────────────────────────────────────────────────────
@@ -463,16 +459,22 @@ class WavelogClient:
             "Accept":       "application/json",
         })
 
-    def send_radio_data(self, frequency: int, mode: str) -> tuple[bool, str]:
-        url     = f"{self.base_url}/api/radio"
-        payload = {
+    # NEU 4 – power_w wird optional mitgesendet
+    def send_radio_data(self, frequency: int, mode: str,
+                        power_w: float = 0.0) -> tuple[bool, str]:
+        url = f"{self.base_url}/api/radio"
+        payload: dict = {
             "key":       self.api_key,
             "radio":     self.radio_name,
             "frequency": frequency,
             "mode":      mode,
             "timestamp": datetime.datetime.utcnow().strftime("%Y/%m/%d %H:%M"),
         }
-        log.debug(f"Wavelog POST {url} freq={frequency} mode={mode}")
+        # Sendeleistung nur mitschicken wenn > 0
+        if power_w > 0:
+            payload["power"] = int(round(power_w))
+
+        log.debug(f"Wavelog POST {url} freq={frequency} mode={mode} pwr={power_w:.0f}W")
         try:
             t0   = time.monotonic()
             resp = self._session.post(url, json=payload, timeout=10)
@@ -493,7 +495,7 @@ class WavelogClient:
     def test_connection(self) -> tuple[bool, str, list]:
         url    = f"{self.base_url}/api/version"
         detail = [
-            f"  URL:          {url}",
+            f"  URL:           {url}",
             f"  API-Schlüssel: {self.api_key[:6]}{'*' * max(0, len(self.api_key) - 6)}",
         ]
         log.info(f"Wavelog Verbindungstest: {url}")
@@ -503,7 +505,6 @@ class WavelogClient:
             ms   = int((time.monotonic() - t0) * 1000)
             detail += [f"  HTTP-Status: {resp.status_code} ({ms} ms)",
                        f"  Antwort:     {resp.text[:300]}"]
-            log.info(f"Wavelog test: {resp.status_code} ({ms}ms)")
             if resp.status_code == 200:
                 try:
                     ver = resp.json().get("version", "?")
@@ -525,23 +526,20 @@ class WavelogClient:
             else:
                 return False, f"HTTP {resp.status_code}", detail
         except requests.exceptions.SSLError as e:
-            detail += [f"  SSL-Fehler: {e}",
-                       "  Tipp: Zertifikat ungültig? http:// versuchen."]
+            detail += [f"  SSL-Fehler: {e}", "  Tipp: http:// versuchen."]
             return False, "SSL-Fehler", detail
         except requests.exceptions.ConnectionError as e:
-            detail += [f"  Verbindungsfehler: {e}",
-                       "  Tipp: URL erreichbar? Firewall? VPN?"]
+            detail += [f"  Verbindungsfehler: {e}", "  Tipp: URL erreichbar? Firewall?"]
             return False, "Verbindung fehlgeschlagen", detail
         except requests.exceptions.Timeout:
-            detail += ["  Timeout nach 8 Sekunden",
-                       "  Tipp: Server erreichbar? Port offen?"]
+            detail += ["  Timeout nach 8 Sekunden"]
             return False, "Timeout", detail
         except Exception as e:
             detail.append(f"  Fehler: {type(e).__name__}: {e}")
             return False, str(e), detail
 
 
-# ─── Wavelog Connection Tester (QThread) ──────────────────────────────────────
+# ─── Wavelog Connection Tester ────────────────────────────────────────────────
 
 class WavelogTester(QThread):
     result_ready = pyqtSignal(bool, str, list)
@@ -556,7 +554,6 @@ class WavelogTester(QThread):
         try:
             ok, summary, detail = client.test_connection()
         except Exception as e:
-            log.error(f"WavelogTester exception: {e}", exc_info=True)
             ok, summary, detail = False, str(e), [f"  Ausnahme: {e}"]
         self.result_ready.emit(ok, summary, detail)
 
@@ -569,11 +566,11 @@ class UpdateWorker(QThread):
 
     def __init__(self, config: dict):
         super().__init__()
-        self._config              = dict(config)
-        self._run                 = False
+        self._config = dict(config)
+        self._run    = False
         self._current_data: dict | None = None
-        self._lock                = threading.Lock()
-        self._client              = self._make_client()
+        self._lock   = threading.Lock()
+        self._client = self._make_client()
 
     def _make_client(self) -> WavelogClient:
         return WavelogClient(
@@ -590,21 +587,17 @@ class UpdateWorker(QThread):
         with self._lock:
             self._current_data = data
 
-    # ── BUGFIX ────────────────────────────────────────────────────────────────
+    # BUGFIX
     def clear_radio_data(self) -> None:
-        """Löscht die gespeicherten Frequenz-/Modusdaten.
-
-        Wird aufgerufen, wenn SmartSDR / FlexRadio die Verbindung trennt,
-        damit der Worker keine veralteten Daten mehr an Wavelog sendet.
-        """
+        """Löscht gespeicherte Daten – stoppt Wavelog-Sends nach Disconnect."""
         with self._lock:
             self._current_data = None
-        log.info("UpdateWorker: Frequenzdaten gelöscht (FlexRadio getrennt)")
-    # ── Ende BUGFIX ───────────────────────────────────────────────────────────
+        log.info("UpdateWorker: Daten gelöscht (FlexRadio getrennt)")
 
     def run(self) -> None:
         self._run = True
         log.info("UpdateWorker thread started")
+        wl_fail_count = 0   # NEU 2b – Fehlerzähler für Wavelog
         while self._run:
             interval = max(1, self._config.get("update_interval", 5))
             time.sleep(interval)
@@ -617,14 +610,90 @@ class UpdateWorker(QThread):
             if not self._config.get("wavelog_url") or not self._config.get("wavelog_api_key"):
                 self.log_message.emit("⚠ Wavelog URL oder API-Schlüssel fehlt")
                 continue
-            ok, msg = self._client.send_radio_data(data["frequency"], data["mode"])
+
+            # NEU 4 – power_w aus Daten lesen
+            power_w = data.get("power_w", 0.0)
+            ok, msg = self._client.send_radio_data(
+                data["frequency"], data["mode"], power_w)
             freq_mhz = data["frequency"] / 1_000_000
+
             if ok:
-                self.log_message.emit(f"✓ {freq_mhz:.3f} MHz / {data['mode']}")
-                self.wavelog_status.emit(True,  f"{freq_mhz:.3f} MHz / {data['mode']}")
+                wl_fail_count = 0
+                pwr_str = f" | {int(round(power_w))} W" if power_w > 0 else ""
+                self.log_message.emit(
+                    f"✓ {freq_mhz:.3f} MHz / {data['mode']}{pwr_str}")
+                self.wavelog_status.emit(
+                    True, f"{freq_mhz:.3f} MHz / {data['mode']}{pwr_str}")
             else:
-                self.log_message.emit(f"✗ Wavelog: {msg}")
-                self.wavelog_status.emit(False, msg)
+                wl_fail_count += 1
+                # NEU 2b – nach 3 Fehlern Hinweis ausgeben, danach alle 10 Versuche
+                if wl_fail_count == 1 or wl_fail_count % 10 == 0:
+                    self.log_message.emit(
+                        f"✗ Wavelog ({wl_fail_count}×): {msg} – warte auf Verbindung …")
+                self.wavelog_status.emit(False, f"Fehler ({wl_fail_count}×): {msg}")
+
+    def stop(self) -> None:
+        self._run = False
+
+
+# ─── NEU 2a – FlexRadio Auto-Reconnect Manager ────────────────────────────────
+
+class FlexReconnectManager(QThread):
+    """Überwacht den FlexRadio-Verbindungsstatus.
+    Wenn die Verbindung getrennt ist und Reconnect aktiviert ist, wartet er
+    das konfigurierte Intervall und signalisiert dann einen neuen Verbindungsversuch.
+    """
+    request_connect = pyqtSignal(str, int)   # host, port
+    log_message     = pyqtSignal(str)
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self._config    = dict(config)
+        self._run       = False
+        self._connected = False
+        self._lock      = threading.Lock()
+
+    def set_config(self, config: dict) -> None:
+        self._config = dict(config)
+
+    def set_connected(self, connected: bool) -> None:
+        with self._lock:
+            self._connected = connected
+
+    def run(self) -> None:
+        self._run = True
+        log.info("FlexReconnectManager started")
+        while self._run:
+            time.sleep(1)
+            if not self._run:
+                break
+            with self._lock:
+                connected = self._connected
+            if connected:
+                continue
+            if not self._config.get("flex_reconnect", True):
+                continue
+            host = self._config.get("flex_host", "")
+            if not host:
+                continue
+            sec = max(5, self._config.get("flex_reconnect_sec", 15))
+            # Warte das konfigurierte Intervall, prüfe dabei ob noch getrennt
+            for _ in range(sec):
+                time.sleep(1)
+                if not self._run:
+                    return
+                with self._lock:
+                    if self._connected:
+                        break
+            else:
+                # Immer noch getrennt → Reconnect anfordern
+                with self._lock:
+                    still_disconnected = not self._connected
+                if still_disconnected and self._run:
+                    port = self._config.get("flex_port", 4992)
+                    self.log_message.emit(
+                        f"↻ Auto-Reconnect FlexRadio {host}:{port} …")
+                    self.request_connect.emit(host, port)
 
     def stop(self) -> None:
         self._run = False
@@ -678,16 +747,16 @@ QTabBar::tab:selected{background:#f8fafc;color:#1e293b;
                       font-weight:bold;border-bottom:2px solid #3b82f6;}
 """
 
-
-# ─── Discovery Dialog ─────────────────────────────────────────────────────────
+# ─── NEU 1 – Discovery Dialog mit Vorauswahl ──────────────────────────────────
 
 class DiscoveryDialog(QDialog):
     radio_selected = pyqtSignal(str, int)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, last_ip: str = ""):
         super().__init__(parent)
+        self._last_ip = last_ip
         self.setWindowTitle("FlexRadio entdecken")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(540)
         self.setModal(True)
         self._radios: list[dict] = []
         self._build()
@@ -721,13 +790,20 @@ class DiscoveryDialog(QDialog):
             "QGroupBox{font-size:12px;font-weight:bold;color:#475569;"
             "border:1px solid #e2e8f0;border-radius:6px;margin-top:10px;padding:10px;}")
         ml = QHBoxLayout(manual)
-        self.host_edit = QLineEdit(); self.host_edit.setPlaceholderText("IP-Adresse")
+        self.host_edit = QLineEdit()
+        self.host_edit.setPlaceholderText("IP-Adresse")
         self.host_edit.setStyleSheet(EDIT)
         self.port_edit = QLineEdit("4992"); self.port_edit.setMaximumWidth(65)
         self.port_edit.setStyleSheet(EDIT)
         ml.addWidget(QLabel("Host:")); ml.addWidget(self.host_edit)
         ml.addWidget(QLabel("Port:")); ml.addWidget(self.port_edit)
         lay.addWidget(manual)
+
+        # NEU 1 – Vorauswahl-Hinweis
+        if self._last_ip:
+            pre_lbl = QLabel(f"Letztes Gerät: {self._last_ip}")
+            pre_lbl.setStyleSheet("color:#3b82f6;font-size:12px;")
+            lay.addWidget(pre_lbl)
 
         row = QHBoxLayout()
         self.scan_btn = QPushButton("🔍 Suchen")
@@ -756,13 +832,19 @@ class DiscoveryDialog(QDialog):
     def _show_results(self, radios: list[dict]) -> None:
         self._radios = radios
         self.combo.clear()
+        preselect_idx = 0
         if radios:
-            for r in radios:
+            for i, r in enumerate(radios):
                 label = (f"{r.get('nickname') or r.get('model', 'FlexRadio')}"
                          f" – {r.get('ip', '?')}"
                          + (f" (v{r['version']})" if "version" in r else "")
                          + (f" [{r['status']}]"   if "status"  in r else ""))
+                # NEU 1 – letztes Gerät vorauswählen
+                if self._last_ip and r.get("ip") == self._last_ip:
+                    label += "  ← zuletzt verwendet"
+                    preselect_idx = i
                 self.combo.addItem(label)
+            self.combo.setCurrentIndex(preselect_idx)
             self.status_lbl.setText(f"✓ {len(radios)} Gerät(e) gefunden.")
         else:
             self.combo.addItem("Keine Geräte gefunden")
@@ -790,17 +872,20 @@ class DiscoveryDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.config       = load_config()
-        self._flex:   FlexRadioClient | None = None
-        self._worker: UpdateWorker    | None = None
-        self._tester: WavelogTester   | None = None
-        self._conn = False
+        self.config        = load_config()
+        self._flex:        FlexRadioClient      | None = None
+        self._worker:      UpdateWorker         | None = None
+        self._tester:      WavelogTester        | None = None
+        self._reconnect:   FlexReconnectManager | None = None   # NEU 2a
+        self._conn        = False
+        self._quitting    = False   # NEU 3 – echter Beenden-Flag
 
         self.setWindowTitle("FlexRadio → Wavelog Bridge")
-        self.setMinimumSize(760, 640)
+        self.setMinimumSize(780, 680)
         self._build_ui()
         self._build_tray()
         self._start_worker()
+        self._start_reconnect_manager()   # NEU 2a
         log.info("MainWindow ready")
 
         if self.config.get("auto_connect") and self.config.get("flex_host"):
@@ -815,27 +900,47 @@ class MainWindow(QMainWindow):
         root.setSpacing(0); root.setContentsMargins(0, 0, 0, 0)
 
         # Header
-        hdr = QFrame(); hdr.setStyleSheet("background:#0f172a;border:none;"); hdr.setFixedHeight(64)
-        hl  = QHBoxLayout(hdr); hl.setContentsMargins(20, 0, 20, 0)
+        hdr = QFrame()
+        hdr.setStyleSheet("background:#0f172a;border:none;")
+        hdr.setFixedHeight(64)
+        hl = QHBoxLayout(hdr); hl.setContentsMargins(20, 0, 20, 0)
         hl.addWidget(self._lbl("⚡ FlexRadio → Wavelog Bridge",
                                "color:white;font-size:18px;font-weight:bold;"))
         hl.addStretch()
-        self.conn_badge = self._lbl("● Getrennt", "color:#64748b;font-size:13px;font-weight:bold;")
+        self.conn_badge = self._lbl(
+            "● Getrennt", "color:#64748b;font-size:13px;font-weight:bold;")
         hl.addWidget(self.conn_badge)
+
+        # NEU 3 – Beenden-Button im Header
+        quit_btn = QPushButton("✕ Beenden")
+        quit_btn.setToolTip("Programm vollständig beenden (nicht nur in den Tray)")
+        quit_btn.clicked.connect(self._quit_app)
+        quit_btn.setStyleSheet(
+            "QPushButton{background:#dc2626;color:white;border-radius:6px;"
+            "padding:5px 14px;font-size:12px;font-weight:bold;margin-left:12px;}"
+            "QPushButton:hover{background:#b91c1c;}")
+        hl.addWidget(quit_btn)
         root.addWidget(hdr)
 
         # Live status band
-        sf = QFrame(); sf.setStyleSheet("background:#1e293b;border:none;"); sf.setFixedHeight(50)
-        sl = QHBoxLayout(sf); sl.setContentsMargins(20, 0, 20, 0); sl.setSpacing(28)
-        self.freq_lbl = self._lbl("– – –.– – – MHz",
-                                  "color:#38bdf8;font-size:22px;font-weight:bold;font-family:'Consolas';")
-        self.mode_lbl = self._lbl("–", "color:#a78bfa;font-size:18px;font-weight:bold;")
-        sl.addWidget(self.freq_lbl); sl.addWidget(self.mode_lbl); sl.addStretch()
+        sf = QFrame(); sf.setStyleSheet("background:#1e293b;border:none;"); sf.setFixedHeight(54)
+        sl = QHBoxLayout(sf); sl.setContentsMargins(20, 0, 20, 0); sl.setSpacing(24)
+        self.freq_lbl = self._lbl(
+            "– – –.– – – MHz",
+            "color:#38bdf8;font-size:22px;font-weight:bold;font-family:'Consolas';")
+        self.mode_lbl = self._lbl(
+            "–", "color:#a78bfa;font-size:18px;font-weight:bold;")
+        # NEU 4 – Leistungsanzeige
+        self.pwr_lbl  = self._lbl(
+            "– W", "color:#fb923c;font-size:16px;font-weight:bold;")
+        sl.addWidget(self.freq_lbl)
+        sl.addWidget(self.mode_lbl)
+        sl.addWidget(self.pwr_lbl)
+        sl.addStretch()
         self.wl_badge = self._lbl("Wavelog: –", "color:#64748b;font-size:12px;")
         sl.addWidget(self.wl_badge)
         root.addWidget(sf)
 
-        # Tabs
         tabs = QTabWidget(); root.addWidget(tabs)
         tabs.addTab(self._build_tab_control(), "Steuerung")
         tabs.addTab(self._build_tab_config(),  "Konfiguration")
@@ -851,22 +956,42 @@ class MainWindow(QMainWindow):
 
         # FlexRadio group
         fg = QGroupBox("FlexRadio Verbindung"); ff = QFormLayout(fg); ff.setSpacing(10)
-        host_txt       = self.config.get("flex_host") or "Nicht konfiguriert"
-        self.host_lbl  = self._lbl(host_txt, "color:#475569;font-size:13px;")
+        host_txt      = self.config.get("flex_host") or "Nicht konfiguriert"
+        self.host_lbl = self._lbl(host_txt, "color:#475569;font-size:13px;")
         ff.addRow("Gerät:", self.host_lbl)
+
         br = QHBoxLayout()
         self.discover_btn = QPushButton("🔍 Gerät suchen")
         self.discover_btn.clicked.connect(self._open_discovery)
         self.discover_btn.setStyleSheet(BTN_P % ("#3b82f6", "#2563eb"))
-        self.connect_btn  = QPushButton("Verbinden")
+        self.connect_btn = QPushButton("Verbinden")
         self.connect_btn.clicked.connect(self._toggle_conn)
         self.connect_btn.setStyleSheet(BTN_P % ("#22c55e", "#16a34a"))
         br.addWidget(self.discover_btn); br.addWidget(self.connect_btn); br.addStretch()
         ff.addRow("", br)
+
         self.auto_cb = QCheckBox("Beim Start automatisch verbinden")
         self.auto_cb.setChecked(bool(self.config.get("auto_connect")))
         self.auto_cb.toggled.connect(lambda v: self._patch("auto_connect", v))
         ff.addRow("", self.auto_cb)
+
+        # NEU 2a – Reconnect-Checkbox
+        self.reconnect_cb = QCheckBox("Automatisch neu verbinden bei Verbindungsverlust")
+        self.reconnect_cb.setChecked(bool(self.config.get("flex_reconnect", True)))
+        self.reconnect_cb.toggled.connect(self._on_reconnect_toggle)
+        ff.addRow("", self.reconnect_cb)
+
+        reconnect_row = QHBoxLayout()
+        reconnect_row.addWidget(QLabel("Wiederverbindungsintervall:"))
+        self.reconnect_spin = QSpinBox()
+        self.reconnect_spin.setRange(5, 300)
+        self.reconnect_spin.setValue(self.config.get("flex_reconnect_sec", 15))
+        self.reconnect_spin.setSuffix(" s")
+        self.reconnect_spin.setMaximumWidth(90)
+        self.reconnect_spin.valueChanged.connect(
+            lambda v: self._patch("flex_reconnect_sec", v))
+        reconnect_row.addWidget(self.reconnect_spin); reconnect_row.addStretch()
+        ff.addRow("", reconnect_row)
         cl.addWidget(fg)
 
         # Slice selection group
@@ -896,13 +1021,15 @@ class MainWindow(QMainWindow):
         self.slice_combo.currentIndexChanged.connect(self._on_slice_combo_changed)
         cr.addWidget(self._lbl("Slice:")); cr.addWidget(self.slice_combo, stretch=1)
         sv.addLayout(cr)
-        self.slice_status_lbl = self._lbl("Kein FlexRadio verbunden", "color:#64748b;font-size:12px;")
+        self.slice_status_lbl = self._lbl(
+            "Kein FlexRadio verbunden", "color:#64748b;font-size:12px;")
         sv.addWidget(self.slice_status_lbl)
         cl.addWidget(sg)
 
         # Log group
         lg = QGroupBox("Protokoll"); lv = QVBoxLayout(lg)
-        self.log_out = QTextEdit(); self.log_out.setReadOnly(True); self.log_out.setMinimumHeight(180)
+        self.log_out = QTextEdit()
+        self.log_out.setReadOnly(True); self.log_out.setMinimumHeight(160)
         lv.addWidget(self.log_out)
         clr = QPushButton("Löschen"); clr.setMaximumWidth(80)
         clr.setStyleSheet(BTN_N); clr.clicked.connect(self.log_out.clear)
@@ -943,7 +1070,8 @@ class MainWindow(QMainWindow):
         wf.addRow("Funkgerät-Name:", self.rname)
 
         self.interval = QSpinBox()
-        self.interval.setRange(1, 120); self.interval.setValue(self.config.get("update_interval", 5))
+        self.interval.setRange(1, 120)
+        self.interval.setValue(self.config.get("update_interval", 5))
         self.interval.setSuffix(" Sekunden")
         wf.addRow("Update-Intervall:", self.interval)
 
@@ -973,7 +1101,8 @@ class MainWindow(QMainWindow):
         self._tray_status = QAction("Status: Getrennt", self)
         self._tray_status.setEnabled(False); menu.addAction(self._tray_status)
         menu.addSeparator()
-        quit_a = QAction("Beenden", self); quit_a.triggered.connect(QApplication.quit)
+        # NEU 3 – auch im Tray-Menü: echter Beenden-Eintrag
+        quit_a = QAction("Beenden", self); quit_a.triggered.connect(self._quit_app)
         menu.addAction(quit_a)
         self._tray.setContextMenu(menu)
         self._tray.activated.connect(
@@ -981,22 +1110,39 @@ class MainWindow(QMainWindow):
             if r == QSystemTrayIcon.ActivationReason.DoubleClick else None)
         self._tray.show()
 
+    # ── Worker / Reconnect Manager ────────────────────────────────────────────
+
     def _start_worker(self) -> None:
         self._worker = UpdateWorker(self.config)
         self._worker.log_message.connect(self._append_log)
         self._worker.wavelog_status.connect(self._on_wl_status)
         self._worker.start()
 
+    def _start_reconnect_manager(self) -> None:
+        # NEU 2a
+        self._reconnect = FlexReconnectManager(self.config)
+        self._reconnect.request_connect.connect(self._on_reconnect_request)
+        self._reconnect.log_message.connect(self._append_log)
+        self._reconnect.start()
+
     # ── Connection ────────────────────────────────────────────────────────────
 
     def _open_discovery(self) -> None:
-        dlg = DiscoveryDialog(self)
+        # NEU 1 – letztes IP mitgeben
+        last_ip = self.config.get("last_flex_ip", "")
+        dlg = DiscoveryDialog(self, last_ip=last_ip)
         dlg.radio_selected.connect(self._on_radio_selected)
         dlg.exec()
 
     def _on_radio_selected(self, host: str, port: int) -> None:
-        self.config["flex_host"] = host; self.config["flex_port"] = port
-        self.host_lbl.setText(f"{host}:{port}"); save_config(self.config)
+        self.config["flex_host"]    = host
+        self.config["flex_port"]    = port
+        # NEU 1 – IP für nächste Sitzung merken
+        self.config["last_flex_ip"] = host
+        self.host_lbl.setText(f"{host}:{port}")
+        save_config(self.config)
+        if self._reconnect:
+            self._reconnect.set_config(self.config)
         self._append_log(f"Gerät ausgewählt: {host}:{port}")
         self._connect_to(host, port)
 
@@ -1016,10 +1162,17 @@ class MainWindow(QMainWindow):
         if host:
             self._connect_to(host, self.config.get("flex_port", 4992))
 
+    # NEU 2a – wird vom FlexReconnectManager aufgerufen
+    @pyqtSlot(str, int)
+    def _on_reconnect_request(self, host: str, port: int) -> None:
+        if self._conn:
+            return   # inzwischen wieder verbunden
+        log.info(f"Reconnect-Request empfangen: {host}:{port}")
+        self._connect_to(host, port)
+
     def _connect_to(self, host: str, port: int) -> None:
         if self._flex and self._flex.isRunning():
             self._flex.stop(); self._flex.wait(2000)
-
         self._append_log(f"Verbinde mit {host}:{port} …")
         self._flex = FlexRadioClient(host, port)
         self._flex.status_changed.connect(self._on_flex_status)
@@ -1035,14 +1188,31 @@ class MainWindow(QMainWindow):
             self._flex = None
         self._on_flex_status("disconnected")
 
+    # NEU 3 – echter Programmabschluss
+    def _quit_app(self) -> None:
+        self._quitting = True
+        log.info("Benutzer hat Beenden gewählt – Programm wird beendet")
+        # Threads sauber stoppen
+        if self._reconnect:
+            self._reconnect.stop(); self._reconnect.wait(2000)
+        if self._flex:
+            self._flex.stop(); self._flex.wait(2000)
+        if self._worker:
+            self._worker.stop(); self._worker.wait(2000)
+        QApplication.quit()
+
     # ── Signal Handlers ───────────────────────────────────────────────────────
 
     @pyqtSlot(str)
     def _on_flex_status(self, status: str) -> None:
         connected = (status == "connected")
         self._conn = connected
-        self.conn_badge.setText(
-            "● Verbunden" if connected else "● Getrennt")
+
+        # NEU 2a – Reconnect-Manager informieren
+        if self._reconnect:
+            self._reconnect.set_connected(connected)
+
+        self.conn_badge.setText("● Verbunden" if connected else "● Getrennt")
         self.conn_badge.setStyleSheet(
             f"color:{'#22c55e' if connected else '#64748b'};"
             "font-size:13px;font-weight:bold;")
@@ -1050,24 +1220,24 @@ class MainWindow(QMainWindow):
         self.connect_btn.setStyleSheet(
             BTN_P % (("#ef4444", "#dc2626") if connected else ("#22c55e", "#16a34a")))
         self._tray.setIcon(make_tray_icon(connected))
-        self._tray_status.setText(
-            f"Status: {'Verbunden' if connected else 'Getrennt'}")
+        self._tray_status.setText(f"Status: {'Verbunden' if connected else 'Getrennt'}")
 
-        # ── BUGFIX ────────────────────────────────────────────────────────────
-        # Wenn FlexRadio / SmartSDR die Verbindung trennt, gespeicherte
-        # Frequenz-/Modusdaten löschen, damit der UpdateWorker keine
-        # veralteten Daten mehr an Wavelog sendet.
+        # BUGFIX + Anzeige zurücksetzen
         if not connected and self._worker:
             self._worker.clear_radio_data()
             self.freq_lbl.setText("– – –.– – – MHz")
             self.mode_lbl.setText("–")
+            self.pwr_lbl.setText("– W")   # NEU 4
             self.wl_badge.setText("Wavelog: –")
             self.wl_badge.setStyleSheet("color:#64748b;font-size:12px;")
-        # ── Ende BUGFIX ───────────────────────────────────────────────────────
-
-        if not connected:
             self.slice_combo.clear()
-            self.slice_status_lbl.setText("Kein FlexRadio verbunden")
+            self.slice_status_lbl.setText(
+                "Kein FlexRadio verbunden"
+                if not self.config.get("flex_reconnect")
+                else "Kein FlexRadio verbunden – Auto-Reconnect aktiv …")
+
+        if connected:
+            self.slice_status_lbl.setText("Verbunden – warte auf Slice-Daten …")
 
     @pyqtSlot(str)
     def _on_radio_data(self, payload_json: str) -> None:
@@ -1078,6 +1248,9 @@ class MainWindow(QMainWindow):
             return
         self.freq_lbl.setText(f"{data['freq_mhz']:.3f} MHz")
         self.mode_lbl.setText(data["mode"])
+        # NEU 4 – Leistungsanzeige
+        pwr = data.get("power_w", 0.0)
+        self.pwr_lbl.setText(f"{int(round(pwr))} W" if pwr > 0 else "– W")
         if self._worker:
             self._worker.update_radio_data(data)
 
@@ -1096,18 +1269,26 @@ class MainWindow(QMainWindow):
         self.wl_badge.setText(f"Wavelog: {msg}")
         self.wl_badge.setStyleSheet(f"color:{color};font-size:12px;")
 
+    # ── Reconnect config handler ───────────────────────────────────────────────
+
+    def _on_reconnect_toggle(self, enabled: bool) -> None:
+        self._patch("flex_reconnect", enabled)
+        if self._reconnect:
+            self._reconnect.set_config(self.config)
+
     # ── Slice UI ──────────────────────────────────────────────────────────────
 
     def _refresh_slice_combo(self, slices: dict) -> None:
         self.slice_combo.blockSignals(True)
         prev = self.slice_combo.currentData()
         self.slice_combo.clear()
-        for idx, s in sorted(slices.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 99):
+        for idx, s in sorted(slices.items(),
+                              key=lambda x: int(x[0]) if x[0].isdigit() else 99):
             freq = s.get("rf_frequency", 0)
             mode = s.get("mode", "?")
             tx   = " [TX]" if s.get("tx") else ""
-            self.slice_combo.addItem(f"Slice {idx}: {freq:.3f} MHz {mode}{tx}", userData=idx)
-        # Restore selection if still present
+            self.slice_combo.addItem(
+                f"Slice {idx}: {freq:.3f} MHz {mode}{tx}", userData=idx)
         for i in range(self.slice_combo.count()):
             if self.slice_combo.itemData(i) == prev:
                 self.slice_combo.setCurrentIndex(i)
@@ -1115,7 +1296,8 @@ class MainWindow(QMainWindow):
         self.slice_combo.blockSignals(False)
         n = self.slice_combo.count()
         self.slice_status_lbl.setText(
-            f"{n} Slice(s) verfügbar" if n else "Keine Slices – öffne einen Slice in SmartSDR")
+            f"{n} Slice(s) verfügbar" if n
+            else "Keine Slices – öffne einen Slice in SmartSDR")
 
     def _set_slice_auto(self) -> None:
         self.slice_auto_btn.setChecked(True)
@@ -1144,14 +1326,18 @@ class MainWindow(QMainWindow):
 
     def _save_config(self) -> None:
         self.config.update({
-            "wavelog_url":     self.url_edit.text().strip(),
-            "wavelog_api_key": self.key_edit.text().strip(),
-            "radio_name":      self.rname.text().strip() or "FlexRadio 6600",
-            "update_interval": self.interval.value(),
+            "wavelog_url":        self.url_edit.text().strip(),
+            "wavelog_api_key":    self.key_edit.text().strip(),
+            "radio_name":         self.rname.text().strip() or "FlexRadio 6600",
+            "update_interval":    self.interval.value(),
+            "flex_reconnect":     self.reconnect_cb.isChecked(),
+            "flex_reconnect_sec": self.reconnect_spin.value(),
         })
         save_config(self.config)
         if self._worker:
             self._worker.set_config(self.config)
+        if self._reconnect:
+            self._reconnect.set_config(self.config)
         self._append_log("✓ Einstellungen gespeichert")
 
     def _patch(self, key: str, value) -> None:
@@ -1185,19 +1371,24 @@ class MainWindow(QMainWindow):
     # ── Log ───────────────────────────────────────────────────────────────────
 
     def _append_log(self, text: str) -> None:
-        ts  = datetime.datetime.now().strftime("%H:%M:%S")
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
         self.log_out.append(f"[{ts}] {text}")
         log.debug(f"GUI-Log: {text}")
 
-    # ── Window close → tray ───────────────────────────────────────────────────
+    # ── Window close → tray (NEU 3: nur wenn nicht _quitting) ────────────────
 
     def closeEvent(self, event) -> None:
+        if self._quitting:
+            event.accept()
+            return
+        # Normales Schließen → in Tray minimieren
         event.ignore()
         self.hide()
         self._tray.showMessage(
             "FlexRadio → Wavelog Bridge",
-            "Läuft weiterhin im System-Tray. Doppelklick zum Öffnen.",
-            QSystemTrayIcon.MessageIcon.Information, 3000)
+            "Läuft weiterhin im System-Tray. Doppelklick zum Öffnen.\n"
+            "Zum Beenden: Tray-Menü → Beenden oder '✕ Beenden'-Button.",
+            QSystemTrayIcon.MessageIcon.Information, 4000)
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
