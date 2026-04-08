@@ -13,6 +13,9 @@ NEU  4  : Sendeleistung (RF-Power in Watt) wird vom FlexRadio ausgelesen
           und als „power\" an die Wavelog-API übermittelt.
 PLAT    : Plattformunabhängig – läuft auf Windows, macOS und Linux.
           Log- und Konfigurationsdateien liegen im Programmverzeichnis.
+AETHER  : Kompatibel mit AetherSDR als SDR-Client (zusätzlich zu SmartSDR).
+          client_handle-Filterung für Multi-Client-Betrieb, keepalive enable,
+          FDVU/FDVM-Modusmapping und robuste Status-Topic-Erkennung.
 """
 
 import sys, os, errno, json, socket, struct, threading, time, logging, datetime, requests
@@ -68,6 +71,9 @@ DEFAULT_CONFIG = {
     "flex_reconnect_sec": 15,
     # NEU 1 – letztes bekanntes Gerät (IP gespeichert für Vorauswahl)
     "last_flex_ip":       "",
+    # AETHER – Multi-Client: nur Slices des eigenen client_handle verfolgen
+    # "" = kein Filter (SmartSDR-Einzelbetrieb); automatisch gesetzt bei Connect
+    "client_handle_filter": True,
 }
 
 def load_config() -> dict:
@@ -195,7 +201,9 @@ class FlexRadioClient(QThread):
         "AM":  "AM",  "SAM": "AM",
         "FM":  "FM",  "NFM": "FM",  "DFM": "FM",
         "CW":  "CW",  "RTTY": "RTTY",
-        "DIGU": "DIGI", "DIGL": "DIGI", "FDV": "DIGI",
+        # FDV = SmartSDR, FDVU/FDVM = AetherSDR FreeDV-Modi
+        "DIGU": "DIGI", "DIGL": "DIGI",
+        "FDV": "DIGI", "FDVU": "DIGI", "FDVM": "DIGI",
     }
 
     def __init__(self, host: str, port: int = 4992):
@@ -210,6 +218,10 @@ class FlexRadioClient(QThread):
         self.selected_slice: str | None = None
         # NEU 4 – Sendeleistung: global pro Radio (nicht pro Slice)
         self._rf_power_w: float = 0.0
+        # AETHER – Multi-Client-Filterung: eigener Handle + bekannte Slice-IDs
+        self._own_handle: str = ""          # vom Radio zugewiesener Client-Handle
+        self._owned_slice_ids: set[str] = set()  # Slices die uns gehören
+        self.filter_by_handle: bool = True  # False = kein Filter (Einzelbetrieb)
 
     # PLAT 2 – Portable Socket-Fehlercodes (kein WSAE* direkt).
     # errno-Modul liefert die systemspezifischen Werte; auf Windows zusätzlich
@@ -237,7 +249,12 @@ class FlexRadioClient(QThread):
             self.log_message.emit(f"✓ TCP verbunden: {self.host}:{self.port}")
             log.info(f"TCP connected: {self.host}:{self.port}")
 
+            # AETHER – keepalive enable verhindert Radio-seitigen Timeout
+            # bei AetherSDR und ist auch unter SmartSDR harmlos.
+            self._cmd("keepalive enable")
             for cmd in ("client program FlexWavelogBridge",
+                        "client gui",
+                        "client station FlexWavelogBridge",
                         "client start_persistence off",
                         "sub client all",
                         "sub tx all",
@@ -322,6 +339,9 @@ class FlexRadioClient(QThread):
         ch = line[0]
         if ch == 'H':
             self._handle = line[1:].split("|")[0]
+            # AETHER – eigenen Handle merken für client_handle-Filterung
+            self._own_handle = self._handle
+            log.info(f"Eigener Client-Handle: 0x{self._own_handle}")
             self.log_message.emit(f"Client-Handle: 0x{self._handle}")
         elif ch == 'V':
             self.log_message.emit(f"Protokoll-Version: {line[1:]}")
@@ -349,10 +369,48 @@ class FlexRadioClient(QThread):
             if "in_use=0" in body:
                 if idx in self._slices:
                     del self._slices[idx]
+                    self._owned_slice_ids.discard(idx)
                     log.info(f"Slice {idx} entfernt")
                     self._emit_slices()
                 return
-            self._update_slice(idx, body[len("slice ") + len(idx) + 1:])
+            # AETHER – client_handle-Filterung für Multi-Client-Betrieb
+            # (AetherSDR, SmartSDR und Maestro können gleichzeitig verbunden sein).
+            # Sobald client_handle in einem Status-Update auftaucht, prüfen wir
+            # ob der Slice uns gehört. Slices anderer Clients werden ignoriert.
+            update_str = body[len("slice ") + len(idx) + 1:]
+            if self.filter_by_handle and self._own_handle:
+                # client_handle extrahieren falls vorhanden
+                _ch = None
+                for _kv in update_str.split():
+                    if "=" not in _kv:
+                        continue
+                    _k, _, _v = _kv.partition("=")
+                    if _k.lower() == "client_handle":
+                        _ch = _v.lstrip("0x").lower()
+                        break
+                if _ch is not None:
+                    own = self._own_handle.lstrip("0x").lower()
+                    if _ch == own:
+                        # Slice gehört uns – in die Owned-Menge aufnehmen
+                        self._owned_slice_ids.add(idx)
+                        log.info(f"Slice {idx} als eigener Slice erkannt (handle={_ch})")
+                    else:
+                        # Slice gehört einem anderen Client – ignorieren
+                        if idx in self._slices:
+                            del self._slices[idx]
+                            self._owned_slice_ids.discard(idx)
+                            log.info(f"Slice {idx} fremdem Client zugewiesen ({_ch}) – entfernt")
+                            self._emit_slices()
+                        return
+                elif idx not in self._owned_slice_ids and idx in self._slices:
+                    # Bekannter Slice ohne client_handle → weiter beobachten (normal)
+                    pass
+                elif idx not in self._owned_slice_ids and self._owned_slice_ids:
+                    # Unbekannter Slice ohne Handle-Info und wir haben schon eigene –
+                    # vorsichtshalber ignorieren bis Handle bestätigt
+                    log.debug(f"Slice {idx} ohne client_handle – warte auf Bestätigung")
+                    return
+            self._update_slice(idx, update_str)
 
         # NEU 4 – Transmit-Status: enthält key "rfpower" (0-100, Prozent der max. Leistung)
         # und "tune_power" sowie senden wir "power" in Watt über das Slice-Objekt weiter.
@@ -911,7 +969,7 @@ class MainWindow(QMainWindow):
         self._conn        = False
         self._quitting    = False   # NEU 3 – echter Beenden-Flag
 
-        self.setWindowTitle("FlexRadio → Wavelog Bridge")
+        self.setWindowTitle("FlexRadio → Wavelog Bridge  (SmartSDR & AetherSDR)")
         self.setMinimumSize(780, 680)
         self._build_ui()
         self._build_tray()
@@ -936,7 +994,7 @@ class MainWindow(QMainWindow):
         hdr.setFixedHeight(64)
         hl = QHBoxLayout(hdr); hl.setContentsMargins(20, 0, 20, 0)
         hl.addWidget(self._lbl("⚡ FlexRadio → Wavelog Bridge",
-                               "color:white;font-size:18px;font-weight:bold;"))
+                               "color:white;font-size:17px;font-weight:bold;"))
         hl.addStretch()
         self.conn_badge = self._lbl(
             "● Getrennt", "color:#64748b;font-size:13px;font-weight:bold;")
@@ -1053,7 +1111,7 @@ class MainWindow(QMainWindow):
         cr.addWidget(self._lbl("Slice:")); cr.addWidget(self.slice_combo, stretch=1)
         sv.addLayout(cr)
         self.slice_status_lbl = self._lbl(
-            "Kein FlexRadio verbunden", "color:#64748b;font-size:12px;")
+            "Kein FlexRadio / AetherSDR verbunden", "color:#64748b;font-size:12px;")
         sv.addWidget(self.slice_status_lbl)
         cl.addWidget(sg)
 
@@ -1105,6 +1163,18 @@ class MainWindow(QMainWindow):
         self.interval.setValue(self.config.get("update_interval", 5))
         self.interval.setSuffix(" Sekunden")
         wf.addRow("Update-Intervall:", self.interval)
+
+        # AETHER – Multi-Client-Filterung
+        self.handle_filter_cb = QCheckBox(
+            "Multi-Client-Filterung (empfohlen bei AetherSDR / Maestro)")
+        self.handle_filter_cb.setToolTip(
+            "Ignoriert Slices anderer verbundener Clients (AetherSDR, SmartSDR, Maestro).\n"
+            "Deaktivieren nur bei Problemen im reinen SmartSDR-Einzelbetrieb.")
+        self.handle_filter_cb.setChecked(
+            bool(self.config.get("client_handle_filter", True)))
+        self.handle_filter_cb.toggled.connect(
+            lambda v: self._patch("client_handle_filter", v))
+        wf.addRow("", self.handle_filter_cb)
 
         test_btn = QPushButton("🔗 Wavelog-Verbindung testen")
         test_btn.clicked.connect(self._test_wavelog)
@@ -1215,6 +1285,9 @@ class MainWindow(QMainWindow):
             self._flex.stop(); self._flex.wait(2000)
         self._append_log(f"Verbinde mit {host}:{port} …")
         self._flex = FlexRadioClient(host, port)
+        # AETHER – Multi-Client-Filter aus Konfiguration übernehmen
+        self._flex.filter_by_handle = bool(
+            self.config.get("client_handle_filter", True))
         self._flex.status_changed.connect(self._on_flex_status)
         self._flex.radio_data.connect(self._on_radio_data)
         self._flex.log_message.connect(self._append_log)
@@ -1368,13 +1441,17 @@ class MainWindow(QMainWindow):
 
     def _save_config(self) -> None:
         self.config.update({
-            "wavelog_url":        self.url_edit.text().strip(),
-            "wavelog_api_key":    self.key_edit.text().strip(),
-            "radio_name":         self.rname.text().strip() or "FlexRadio 6600",
-            "update_interval":    self.interval.value(),
-            "flex_reconnect":     self.reconnect_cb.isChecked(),
-            "flex_reconnect_sec": self.reconnect_spin.value(),
+            "wavelog_url":          self.url_edit.text().strip(),
+            "wavelog_api_key":      self.key_edit.text().strip(),
+            "radio_name":           self.rname.text().strip() or "FlexRadio 6600",
+            "update_interval":      self.interval.value(),
+            "flex_reconnect":       self.reconnect_cb.isChecked(),
+            "flex_reconnect_sec":   self.reconnect_spin.value(),
+            "client_handle_filter": self.handle_filter_cb.isChecked(),
         })
+        # AETHER – Filter-Einstellung live an aktive Verbindung weitergeben
+        if self._flex:
+            self._flex.filter_by_handle = self.config["client_handle_filter"]
         save_config(self.config)
         if self._worker:
             self._worker.set_config(self.config)
