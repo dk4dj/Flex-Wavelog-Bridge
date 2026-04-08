@@ -11,9 +11,11 @@ NEU  3  : „Beenden"-Button im GUI – beendet das Programm vollständig.
           Normales Schließen des Fensters schickt es weiterhin in den Tray.
 NEU  4  : Sendeleistung (RF-Power in Watt) wird vom FlexRadio ausgelesen
           und als „power\" an die Wavelog-API übermittelt.
+PLAT    : Plattformunabhängig – läuft auf Windows, macOS und Linux.
+          Log- und Konfigurationsdateien liegen im Programmverzeichnis.
 """
 
-import sys, os, json, socket, struct, threading, time, logging, datetime, requests
+import sys, os, errno, json, socket, struct, threading, time, logging, datetime, requests
 
 from pathlib import Path
 from PyQt6.QtWidgets import (
@@ -25,10 +27,17 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, pyqtSlot
 from PyQt6.QtGui import QIcon, QPixmap, QColor, QPainter, QPen, QAction
 
+# ─── Plattform-Erkennung ──────────────────────────────────────────────────────
+IS_WIN   = sys.platform == "win32"
+IS_MAC   = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+# ─── PLAT 1 – Pfade: Log und Config liegen neben dem Programmskript ──────────
+# __file__ zeigt auf flex_wavelog_bridge.py – unabhängig vom Betriebssystem.
+_BASE_DIR = Path(__file__).resolve().parent
+LOG_FILE  = _BASE_DIR / "bridge.log"
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
-LOG_DIR = Path(os.environ.get("APPDATA", ".")) / "FlexWavelogBridge"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "bridge.log"
 
 _log_handlers: list = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
 if sys.stdout is not None:
@@ -42,7 +51,7 @@ logging.basicConfig(
 log = logging.getLogger("FlexWavelog")
 log.info(f"=== FlexRadio→Wavelog Bridge start (log: {LOG_FILE}) ===")
 
-CONFIG_FILE = LOG_DIR / "config.json"
+CONFIG_FILE = _BASE_DIR / "config.json"
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -137,7 +146,12 @@ class FlexDiscovery:
         def _listen() -> None:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # PLAT 3 – SO_REUSEPORT bevorzugt auf macOS/Linux;
+                # Fallback auf SO_REUSEADDR wenn nicht verfügbar (Windows).
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except AttributeError:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.settimeout(0.5)
                 try:
                     sock.bind(("", DISCOVERY_PORT))
@@ -197,7 +211,17 @@ class FlexRadioClient(QThread):
         # NEU 4 – Sendeleistung: global pro Radio (nicht pro Slice)
         self._rf_power_w: float = 0.0
 
-    _CLOSED_ERRNOS = {10038, 10054, 10053, 9}
+    # PLAT 2 – Portable Socket-Fehlercodes (kein WSAE* direkt).
+    # errno-Modul liefert die systemspezifischen Werte; auf Windows zusätzlich
+    # winerror-Codes abfangen, die nicht im errno-Namensraum auftauchen.
+    _CLOSED_ERRNOS = {
+        errno.EBADF,          # 9  POSIX – ungültiger Filedeskriptor
+        errno.ECONNRESET,     # 104 Linux / 54 macOS / 10054 Windows
+        errno.ECONNABORTED,   # 103 Linux / 53 macOS / 10053 Windows
+        errno.ENOTSOCK,       # 88  Linux / 38 macOS
+    }
+    # Zusätzlich Windows-spezifische winerror-Codes (WSAE*)
+    _CLOSED_WINERRNOS = {10038, 10053, 10054} if IS_WIN else set()
 
     def run(self) -> None:
         self._run = True
@@ -241,9 +265,13 @@ class FlexRadioClient(QThread):
                 except socket.timeout:
                     self._cmd("ping")
                 except OSError as e:
-                    winerr = getattr(e, "winerror", None) or e.errno
-                    if winerr in self._CLOSED_ERRNOS or not self._run:
-                        log.info(f"FlexRadio: Socket geschlossen (winerr={winerr})")
+                    # PLAT 2 – errno + optionaler Windows-winerror
+                    _winerr = getattr(e, "winerror", None)
+                    _closed = (e.errno in self._CLOSED_ERRNOS
+                               or _winerr in self._CLOSED_WINERRNOS)
+                    if _closed or not self._run:
+                        log.info(f"FlexRadio: Socket geschlossen "
+                                 f"(errno={e.errno} winerr={_winerr})")
                     else:
                         log.warning(f"FlexRadio recv OSError: {e}")
                         connect_error = str(e)
@@ -254,8 +282,11 @@ class FlexRadioClient(QThread):
         except socket.timeout:
             connect_error = f"Timeout – {self.host}:{self.port} nicht erreichbar (10 s)"
         except OSError as e:
-            winerr = getattr(e, "winerror", None) or e.errno
-            if not (winerr in self._CLOSED_ERRNOS or not self._run):
+            # PLAT 2 – portable errno + optionaler winerror
+            _winerr = getattr(e, "winerror", None)
+            _closed = (e.errno in self._CLOSED_ERRNOS
+                       or _winerr in self._CLOSED_WINERRNOS)
+            if not (_closed or not self._run):
                 connect_error = str(e)
                 log.error(f"FlexRadio OSError: {e}", exc_info=True)
         except Exception as e:
@@ -724,7 +755,7 @@ EDIT  = ("border:1px solid #cbd5e1;border-radius:6px;"
          "padding:6px 10px;background:white;color:#1e293b;")
 
 MAIN_STYLE = """
-QMainWindow,QWidget{background:#f8fafc;font-family:'Segoe UI',sans-serif;}
+QMainWindow,QWidget{background:#f8fafc;font-family:'Segoe UI','SF Pro Text','Helvetica Neue','Liberation Sans',sans-serif;}
 QGroupBox{border:1px solid #e2e8f0;border-radius:8px;
           margin-top:14px;padding:12px;background:white;}
 QGroupBox::title{subcontrol-origin:margin;left:12px;top:-7px;
@@ -739,7 +770,7 @@ QSpinBox{border:1px solid #cbd5e1;border-radius:6px;
 QPushButton{border-radius:6px;padding:7px 16px;font-size:13px;}
 QTextEdit{border:1px solid #e2e8f0;border-radius:6px;
           background:#0f172a;color:#94a3b8;
-          font-family:'Consolas',monospace;font-size:12px;padding:8px;}
+          font-family:'Consolas','Menlo','DejaVu Sans Mono','Courier New',monospace;font-size:12px;padding:8px;}
 QTabWidget::pane{border:none;}
 QTabBar::tab{background:#f1f5f9;color:#64748b;
              padding:8px 20px;border:none;font-size:13px;}
@@ -927,7 +958,7 @@ class MainWindow(QMainWindow):
         sl = QHBoxLayout(sf); sl.setContentsMargins(20, 0, 20, 0); sl.setSpacing(24)
         self.freq_lbl = self._lbl(
             "– – –.– – – MHz",
-            "color:#38bdf8;font-size:22px;font-weight:bold;font-family:'Consolas';")
+            "color:#38bdf8;font-size:22px;font-weight:bold;font-family:'Consolas','Menlo','DejaVu Sans Mono',monospace;")
         self.mode_lbl = self._lbl(
             "–", "color:#a78bfa;font-size:18px;font-weight:bold;")
         # NEU 4 – Leistungsanzeige
@@ -1093,6 +1124,15 @@ class MainWindow(QMainWindow):
     # ── Tray ──────────────────────────────────────────────────────────────────
 
     def _build_tray(self) -> None:
+        # PLAT 4 – Tray ist auf Linux ohne Notification-Daemon nicht verfügbar.
+        # _tray_available steuert closeEvent: kein Tray → Fenster bleibt offen.
+        self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        if not self._tray_available:
+            log.warning("System-Tray nicht verfügbar – Fenster bleibt beim Schließen offen")
+            self._tray        = None
+            self._tray_status = None
+            return
+
         self._tray = QSystemTrayIcon(make_tray_icon(False), self)
         self._tray.setToolTip("FlexRadio → Wavelog Bridge")
         menu = QMenu()
@@ -1219,8 +1259,10 @@ class MainWindow(QMainWindow):
         self.connect_btn.setText("Trennen" if connected else "Verbinden")
         self.connect_btn.setStyleSheet(
             BTN_P % (("#ef4444", "#dc2626") if connected else ("#22c55e", "#16a34a")))
-        self._tray.setIcon(make_tray_icon(connected))
-        self._tray_status.setText(f"Status: {'Verbunden' if connected else 'Getrennt'}")
+        if self._tray:
+            self._tray.setIcon(make_tray_icon(connected))
+        if self._tray_status:
+            self._tray_status.setText(f"Status: {'Verbunden' if connected else 'Getrennt'}")
 
         # BUGFIX + Anzeige zurücksetzen
         if not connected and self._worker:
@@ -1379,6 +1421,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._quitting:
+            event.accept()
+            return
+        # PLAT 4 – Nur in Tray minimieren wenn Tray verfügbar ist
+        if not self._tray_available:
+            # Kein Tray (z.B. Linux ohne Notification-Daemon) → normal beenden
+            self._quitting = True
             event.accept()
             return
         # Normales Schließen → in Tray minimieren
