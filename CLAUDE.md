@@ -1,332 +1,461 @@
-# CLAUDE.md – Technische Dokumentation
+# CLAUDE.md — Technical Documentation
 
-FlexRadio → Wavelog Bridge  
-Entwicklerdokumentation für Claude und zukünftige Maintainer.
-
----
-
-## Projektübersicht
-
-Dieses Programm ist eine Windows-Desktop-Applikation (Python / PyQt6), die:
-
-1. Ein FlexRadio-Gerät per SmartSDR-TCP-API abonniert
-2. Frequenz und Betriebsart des aktiven TX-Slice empfängt
-3. Diese Daten periodisch an die Wavelog-REST-API weiterleitet
-4. Als System-Tray-Anwendung dauerhaft im Hintergrund läuft
+**FlexRadio → Wavelog Bridge**
+Developer documentation for Claude and future maintainers.
 
 ---
 
-## Architektur
+## Project Overview
 
-### Thread-Modell
+A cross-platform desktop application (Python / PyQt6) that:
 
-Das Programm nutzt vier Threads:
+1. Connects to a FlexRadio transceiver via the SmartSDR TCP command API (port 4992)
+2. Receives frequency, operating mode, and TX power from the active TX slice
+3. Periodically forwards this data to the Wavelog REST API
+4. Runs as a system tray application in the background
+5. Works with **SmartSDR** (Windows) and **AetherSDR** (Linux / macOS / Windows) as the SDR client
+
+---
+
+## Architecture
+
+### Thread Model
 
 ```
-GUI-Thread (Qt main)
-│
-├── UpdateWorker (QThread)
-│     Sendet periodisch radio_data an Wavelog-API
-│     Kommunikation: pyqtSignal(str) / pyqtSignal(bool, str)
+GUI Thread (Qt main)
 │
 ├── FlexRadioClient (QThread)
-│     TCP-Verbindung zu SmartSDR auf Port 4992
-│     Kommunikation: pyqtSignal(str) für alle Signale
-│     – status_changed(str)
-│     – radio_data(str)       ← JSON-String, kein pyqtSignal(dict)!
-│     – log_message(str)
-│     – slices_changed(str)   ← JSON-String
+│     TCP connection to SmartSDR / AetherSDR on port 4992
+│     Signals (all str to avoid cross-thread dict serialisation issues):
+│       status_changed(str)    "connected" | "disconnected"
+│       radio_data(str)        JSON payload: frequency, mode, power_w, slice, tx
+│       log_message(str)       Plain text for GUI log
+│       slices_changed(str)    JSON snapshot of all known slices
+│
+├── UpdateWorker (QThread)
+│     Periodically sends radio_data to Wavelog API
+│     Signals:
+│       log_message(str)
+│       wavelog_status(bool, str)
+│
+├── FlexReconnectManager (QThread)
+│     Monitors connection state; emits request_connect(str, int) after timeout
+│     Signals:
+│       request_connect(str, int)   host, port
+│       log_message(str)
 │
 └── WavelogTester (QThread)
-      Einmaliger Verbindungstest, gibt Ergebnis via Signal zurück
-      – result_ready(bool, str, list)
+      One-shot connection test; result via signal
+      Signals:
+        result_ready(bool, str, list)
 ```
 
-### Kritische Design-Entscheidungen
+### Why JSON strings instead of `pyqtSignal(dict)`?
 
-**Warum JSON-Strings statt `pyqtSignal(dict)`?**
+PyQt6 cannot reliably serialise nested dicts for cross-thread signal delivery — it silently swallows the resulting exceptions, breaking the entire signal delivery chain. All complex data is therefore sent as `json.dumps(...)` and parsed with `json.loads(...)` in the receiving slot.
 
-PyQt6 kann `dict`-Objekte mit verschachtelten Werten beim cross-thread Signal-Delivery nicht zuverlässig serialisieren. Das führt zu stillen Exceptions, die Qt verschluckt. Alle komplexen Daten werden daher als `json.dumps(...)` gesendet und im Slot mit `json.loads(...)` wieder geparst.
+### Why `sys.stdout is not None` guard?
 
-**Warum kein `logging.StreamHandler(sys.stdout)`?**
+Under `pythonw.exe` (the windowless launcher on Windows), `sys.stdout = None`. A `StreamHandler` on `None` raises `AttributeError` on the first log call. Because this happens inside a Qt signal slot, Qt aborts the entire delivery chain without any visible error message. The handler is only created when `sys.stdout is not None`.
 
-Unter `pythonw.exe` (das für den fensterloseen Start verwendet wird) ist `sys.stdout = None`. Ein StreamHandler auf `None` wirft `AttributeError` beim ersten Log-Aufruf. Da dieser Fehler innerhalb eines Qt-Signal-Slots auftritt, bricht Qt die gesamte Signal-Delivery-Kette ab – ohne jede Fehlermeldung. Der StreamHandler wird daher nur angelegt wenn `sys.stdout is not None`.
-
-**Warum atomarer Socket-Tausch in `stop()` und `finally`?**
+### Atomic socket swap in `stop()` and `finally`
 
 ```python
-sock, self._sock = self._sock, None   # atomarer Tausch
+sock, self._sock = self._sock, None   # atomic ownership transfer
 ```
 
-`stop()` wird aus dem GUI-Thread aufgerufen, `run()` / `finally` laufen im Worker-Thread. Ohne atomaren Tausch würde `finally` den Socket ein zweites Mal schließen → `WinError 10038 (WSAENOTSOCK)`. Mit dem Tausch besitzt immer nur einer den Socket.
+`stop()` is called from the GUI thread; `run()` / `finally` run on the worker thread. Without the atomic swap `finally` would close the socket a second time, producing `WSAENOTSOCK` / `EBADF`. With the swap exactly one party owns the socket at any time.
 
 ---
 
-## Klassen-Referenz
+## SmartSDR / AetherSDR Protocol
+
+Both clients implement the same FlexLib SmartSDR protocol. The differences that affect the bridge are documented below.
+
+### Message Types
+
+| Prefix | Direction | Meaning |
+|--------|-----------|---------|
+| `V`    | Radio → Client | Firmware version string |
+| `H`    | Radio → Client | Hex client handle (`H<handle>\|...`) |
+| `C`    | Client → Radio | Command: `C<seq>\|<command>\n` |
+| `R`    | Radio → Client | Response: `R<seq>\|<hex_code>\|<msg>` (ignored by bridge) |
+| `S`    | Radio → Client | Status update: `S<handle>\|<topic> <k>=<v> ...` |
+| `M`    | Radio → Client | Informational message (logged) |
+
+### Connection / Init Sequence
+
+Sent immediately after TCP connect, in this order:
+
+```
+keepalive enable                  ← prevents radio-side timeout (required by AetherSDR)
+client program FlexWavelogBridge
+client gui                        ← registers as GUI client (required for multi-client)
+client station FlexWavelogBridge  ← identifies station to other connected clients
+client start_persistence off
+sub client all                    ← receive client connect/disconnect events
+sub tx all
+sub atu all
+sub slice all
+sub gps all
+sub transmit all                  ← receive rfpower= updates
+```
+
+After `sub client all` the radio sends `H<handle>|...` which contains our client handle. This handle is stored in `_own_handle` and used for multi-client filtering.
+
+### Keepalive
+
+The bridge sends `keepalive enable` on connect. AetherSDR additionally sends `ping ms_timestamp=<t>` every second; the bridge uses `ping` on `socket.timeout` which is sufficient for SmartSDR. `keepalive enable` alone prevents the radio from dropping the connection.
+
+### Slice Status Format
+
+```
+S<handle>|slice <idx> <k>=<v> <k>=<v> ...
+```
+
+Relevant keys parsed by the bridge:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `rf_frequency` | double | Frequency in MHz, e.g. `14.225000` |
+| `mode` | string | Demodulation mode (case-insensitive, normalised to upper) |
+| `tx` | `0` or `1` | This slice is the active TX slice |
+| `in_use` | `0` or `1` | Slice exists (`0` = removed) |
+| `client_handle` | hex string | Which connected client owns this slice |
+
+### Transmit Status Format
+
+```
+S<handle>|transmit rfpower=<0–100> tune_power=<0–100> mox=<0|1> ...
+```
+
+`rfpower` is a percentage of the radio's maximum output power. The bridge forwards it as an integer watt value to Wavelog (1:1 mapping is exact for a 100 W radio).
+
+### Mode Mapping
+
+| FlexRadio / AetherSDR Mode | Wavelog / ADIF |
+|---------------------------|----------------|
+| USB, LSB | SSB |
+| AM, SAM | AM |
+| FM, NFM, DFM | FM |
+| CW | CW |
+| RTTY | RTTY |
+| DIGU, DIGL | DIGI |
+| FDV (SmartSDR) | DIGI |
+| FDVU, FDVM (AetherSDR) | DIGI |
+
+Unknown modes are passed through unchanged.
+
+---
+
+## Multi-Client Filtering (AetherSDR / Maestro compatibility)
+
+When multiple clients are connected simultaneously (e.g. AetherSDR + bridge, or SmartSDR + Maestro + bridge), each client gets its own `client_handle` from the radio. Slice status updates include `client_handle=` in certain messages to identify ownership.
+
+### Implementation (`FlexRadioClient`)
+
+Three new fields control multi-client behaviour:
+
+```python
+self._own_handle: str = ""             # our handle, set from the H message
+self._owned_slice_ids: set[str] = set() # slice IDs confirmed as ours
+self.filter_by_handle: bool = True      # can be disabled via the GUI checkbox
+```
+
+### Filtering Logic in `_parse_status`
+
+For each incoming `slice <idx>` update:
+
+1. Extract `client_handle=` from the update string if present
+2. If it matches `_own_handle` → add `idx` to `_owned_slice_ids`, process normally
+3. If it does not match → remove the slice if we have it, discard the update
+4. If no `client_handle` present and `idx` is already in `_owned_slice_ids` → process normally (subsequent updates for owned slices rarely repeat the handle)
+5. If no `client_handle` present and `idx` is unknown but we already have confirmed owned slices → defer (wait for a message with handle confirmation)
+
+This matches the approach used in AetherSDR (`m_ownedSliceIds`).
+
+**Important timing note:** The radio sends early slice updates *without* `client_handle`. The bridge creates no slice model for those; it waits until a handle-confirmed update arrives. This is why `filter_by_handle` can be disabled for single-client SmartSDR setups where `client_handle` may never appear.
+
+### Config Key
+
+`client_handle_filter` (bool, default `True`) — stored in `config.json`, exposed as a checkbox in the Configuration tab.
+
+---
+
+## Class Reference
 
 ### `FlexDiscovery`
 
-**Zweck:** Empfängt VITA-49 UDP-Broadcast-Pakete vom FlexRadio.
+Listens for VITA-49 binary UDP broadcast packets from the radio on port 4992.
 
-**Protokoll (FlexLib: `Discovery.cs`, `VitaDiscovery.cs`, `VitaFlex.cs`):**
-
-Das FlexRadio sendet binäre VITA-49-Pakete auf UDP-Port 4992:
+**Packet format** (FlexLib: `VitaDiscovery.cs`, `VitaFlex.cs`):
 
 ```
-Offset  Bytes  Inhalt
-  0       4    VITA-Header (big-endian uint32)
-                  bits 31-28: pkt_type  → muss 0x7 sein (ExtDataWithStream)
-                  bit  27:    C-Flag    → muss 1 sein (Class-ID present)
-                  bit  26:    T-Flag    (Trailer present)
-                  bits 25-24: tsi       (Timestamp Integer type)
-                  bits 23-22: tsf       (Timestamp Fractional type)
-                  bits 15-0:  packet_size (in 32-bit-Worten)
-  4       4    Stream-ID (uint32, bei ExtDataWithStream immer present)
-  8       4    OUI-Word  (bits 23-0 = OUI, muss 0x001C2D sein)
- 12       4    ClassCode-Word (bits 15-0 = PacketClassCode, muss 0xFFFF sein)
- 16+      N    UTF-8-Payload: space-separated key=value Paare
- end-4    4    Trailer (optional, nur wenn T-Flag=1)
+Offset  Bytes  Content
+  0       4    VITA header (big-endian uint32)
+                 bits 31–28: pkt_type  must be 0x7 (ExtDataWithStream)
+                 bit  27:    C-flag    must be 1 (Class-ID present)
+                 bit  26:    T-flag    (Trailer present)
+                 bits 25–24: tsi       (Timestamp Integer type)
+                 bits 23–22: tsf       (Timestamp Fractional type)
+                 bits 15–0:  packet_size (in 32-bit words)
+  4       4    Stream-ID (uint32)
+  8       4    OUI word  (bits 23–0 = OUI, must be 0x001C2D)
+ 12       4    ClassCode word (bits 15–0 = PCC, must be 0xFFFF)
+ 16+      N    UTF-8 payload: space-separated key=value pairs
+ end-4    4    Trailer (optional, when T-flag=1)
 ```
 
-Relevante Payload-Keys: `ip`, `model`, `nickname`, `version`, `status`, `serial`, `callsign`, `port`, `available_slices`, `max_slices`
+Relevant payload keys: `ip`, `model`, `nickname`, `version`, `status`, `serial`, `callsign`, `port`, `available_slices`, `max_slices`
 
-**Methoden:**
-- `discover(timeout=4.0) → list[dict]` – blockiert bis `timeout` Sekunden, gibt alle gefundenen Radios zurück
+**Socket options:** `SO_REUSEPORT` is preferred on macOS / Linux; falls back to `SO_REUSEADDR` on Windows (`AttributeError` on missing `SO_REUSEPORT`).
 
 ---
 
 ### `FlexRadioClient(QThread)`
 
-**Zweck:** TCP-Verbindung zum SmartSDR Command API auf Port 4992.
+TCP connection to the SmartSDR command API.
 
-**Protokoll (FlexLib: `TcpCommandCommunication.cs`, `Radio.cs`, `Slice.cs`):**
+**TX-slice logic:**
 
-Alle Nachrichten sind UTF-8, zeilengetrennt (`\n`).
-
-Kommandos vom Client:
-```
-C<seq>|<command>\n
-```
-
-Eingehende Nachrichtentypen:
-```
-H<handle>|...           → Client-Handle zugewiesen (nach Connect)
-V<version>              → Protokollversion
-S<handle>|<topic> ...   → Status-Update
-R<seq>|<code>|<msg>     → Antwort auf Kommando (wird ignoriert)
-M<uptime>|<msg>         → Radio-Meldung (wird geloggt)
-```
-
-Initialisierungssequenz (wird direkt nach Connect gesendet):
-```
-client program FlexWavelogBridge
-client start_persistence off
-sub client all
-sub tx all
-sub atu all
-sub slice all
-sub gps all
-```
-
-**Slice-Status-Format (`Slice.cs::StatusUpdate`):**
-```
-S<handle>|slice <idx> <k>=<v> <k>=<v> ...
-```
-
-Relevante Keys:
-| Key | Typ | Bedeutung |
-|---|---|---|
-| `rf_frequency` | double | Frequenz in MHz, z.B. `14.225000` |
-| `mode` | string | Demodulationsmodus (USB/LSB/AM/FM/CW/RTTY/DIGU/DIGL/...) |
-| `tx` | 0 oder 1 | Dieser Slice ist der aktive TX-Slice |
-| `in_use` | 0 oder 1 | Slice existiert (0 = entfernt) |
-
-**TX-Slice-Logik:**
-- Jeder `tx=1`-Update setzt alle anderen Slices auf `tx=False`
-- `_active_slice_idx()` gibt zurück:
-  - `selected_slice` wenn manuell gesetzt und in `_slices` vorhanden
-  - Den Slice mit `tx=True` im Auto-Modus
-  - Den numerisch niedrigsten Slice als Fallback
+- `tx=1` on any slice sets all other slices to `tx=False`
+- `_active_slice_idx()` returns:
+  - `selected_slice` if manually set and present in `_slices`
+  - The slice with `tx=True` in Auto mode
+  - The numerically lowest slice as fallback
 
 **Signals:**
-| Signal | Typ | Inhalt |
-|---|---|---|
-| `status_changed` | `str` | `"connected"` / `"disconnected"` / `"error: <msg>"` |
-| `radio_data` | `str` | JSON: `{frequency, mode, raw_mode, freq_mhz, slice, tx}` |
-| `log_message` | `str` | Klartext für GUI-Log |
+
+| Signal | Type | Content |
+|--------|------|---------|
+| `status_changed` | `str` | `"connected"` / `"disconnected"` |
+| `radio_data` | `str` | JSON: `{frequency, mode, raw_mode, freq_mhz, slice, tx, power_w}` |
+| `log_message` | `str` | Plain text for GUI log |
 | `slices_changed` | `str` | JSON: `{idx: {rf_frequency, mode, tx}, ...}` |
 
-**Fehlerbehandlung:**
-- `ConnectionRefusedError` → freundliche Meldung, kein Stack-Trace
-- `socket.timeout` (beim Connect) → freundliche Meldung
-- `OSError` mit WinError 10038/10054/10053 oder `_run=False` → erwartet, wird ignoriert
-- Andere `OSError` → als echter Fehler gemeldet
+**Error handling:**
+
+| Error | Handling |
+|-------|----------|
+| `ConnectionRefusedError` | User-friendly message, no stack trace |
+| `socket.timeout` (on connect) | User-friendly message |
+| `OSError` with errno in `_CLOSED_ERRNOS` or `_run=False` | Expected shutdown, silently ignored |
+| Other `OSError` | Logged as a real error |
+
+**Portable error codes (`_CLOSED_ERRNOS`):**
+
+Uses `errno.EBADF`, `errno.ECONNRESET`, `errno.ECONNABORTED`, `errno.ENOTSOCK` from the stdlib `errno` module — platform-neutral values. Windows-specific `winerror` codes (10038, 10053, 10054) are checked additionally via `getattr(e, "winerror", None)`, only populated on Windows.
 
 ---
 
 ### `WavelogClient`
 
-**Zweck:** REST-Client für die Wavelog-API.
+REST client for the Wavelog API.
 
-**Relevante Endpunkte:**
+**`POST /api/radio` payload:**
 
-`POST /api/radio` – Frequenz und Mode übertragen:
 ```json
 {
   "key":       "API_KEY",
   "radio":     "FlexRadio 6600",
   "frequency": 14225000,
   "mode":      "SSB",
-  "timestamp": "2025/01/15 14:30"
+  "power":     100,
+  "timestamp": "2026/04/09 14:30"
 }
 ```
 
-`POST /api/version` – Verbindungstest:
+`power` is only included when `power_w > 0`.
+
+**`POST /api/version` payload** (connection test):
+
 ```json
 { "key": "API_KEY" }
 ```
-
-**Methoden:**
-- `send_radio_data(frequency: int, mode: str) → (bool, str)` – sendet Daten, gibt `(ok, message)` zurück
-- `test_connection() → (bool, str, list)` – testet `/api/version`, gibt `(ok, summary, detail_lines)` zurück
-
----
-
-### `WavelogTester(QThread)`
-
-**Zweck:** Führt `WavelogClient.test_connection()` im Hintergrund aus und liefert das Ergebnis über ein Qt-Signal zurück. Löst das Problem dass `QTimer.singleShot()` aus einem `daemon`-Thread nicht zuverlässig funktioniert.
-
-**Signal:** `result_ready(bool, str, list)` – `(ok, summary, detail_lines)`
 
 ---
 
 ### `UpdateWorker(QThread)`
 
-**Zweck:** Sendet periodisch die letzte bekannte Frequenz/Mode an Wavelog.
+Periodic Wavelog sender.
 
-**Funktionsweise:**
-1. Schläft `update_interval` Sekunden
-2. Prüft ob `_current_data` gesetzt ist
-3. Prüft ob URL und API-Key konfiguriert sind
-4. Sendet via `WavelogClient.send_radio_data()`
+1. Sleeps `update_interval` seconds
+2. Checks `_current_data is not None`
+3. Checks URL and API key are configured
+4. Calls `WavelogClient.send_radio_data(frequency, mode, power_w)`
+5. Counts consecutive Wavelog failures; logs a warning after the 1st failure and every 10th thereafter
 
-`update_radio_data(data: dict)` – thread-safe Update der zu sendenden Daten (über `threading.Lock`)
+**Thread-safe data update:** `update_radio_data(data: dict)` and `clear_radio_data()` use `threading.Lock`.
+
+**`clear_radio_data()`** is called by `MainWindow._on_flex_status("disconnected")` to stop sending stale data after the SDR client closes.
+
+---
+
+### `FlexReconnectManager(QThread)`
+
+Polls `_connected` every second. When disconnected and `flex_reconnect=True`, waits `flex_reconnect_sec` seconds then emits `request_connect(host, port)`. Respects `set_connected(bool)` called from `MainWindow._on_flex_status`.
 
 ---
 
 ### `MainWindow(QMainWindow)`
 
-**Tabs:**
+**Control tab:**
+- FlexRadio connection group (discovery, connect/disconnect, auto-connect, auto-reconnect)
+- Slice selection (Auto TX / Manual, live-updating combo)
+- Protocol log (scrolling, timestamped)
 
-**Steuerung:**
-- FlexRadio-Verbindungsgruppe (Discovery-Button, Verbinden-Button, Auto-Connect-Checkbox)
-- Slice-Auswahl (Auto/Manuell, Combo mit Live-Update, Statuszeile)
-- Protokollfenster (HTML-formatiert, farbcodiert)
+**Configuration tab:**
+- Wavelog URL, API key (with visibility toggle), radio name, update interval
+- Multi-client filtering checkbox (`client_handle_filter`)
+- Wavelog connection test button
 
-**Konfiguration:**
-- Wavelog URL, API-Schlüssel (mit Sichtbarkeits-Toggle), Funkgerät-Name, Intervall
-- Verbindungstest-Button (unabhängig von FlexRadio-Status)
-- Speichern-Button
+**Key slots:**
 
-**Wichtige Slots:**
-| Slot | Signal-Quelle | Funktion |
-|---|---|---|
-| `_on_flex_status(str)` | `FlexRadioClient.status_changed` | Badge, Tray-Icon, Button-Farbe |
-| `_on_radio_data_json(str)` | `FlexRadioClient.radio_data` | Frequenz/Mode anzeigen, Worker updaten |
-| `_on_slices_changed_json(str)` | `FlexRadioClient.slices_changed` | Combo neu befüllen |
-| `_append_log(str)` | diverse `log_message` | HTML ins Protokollfenster |
-| `_show_test_result(bool,str,list)` | `WavelogTester.result_ready` | Ergebnis + Details anzeigen |
+| Slot | Signal source | Function |
+|------|---------------|----------|
+| `_on_flex_status(str)` | `FlexRadioClient.status_changed` | Badge, tray icon, button style, clear data on disconnect |
+| `_on_radio_data(str)` | `FlexRadioClient.radio_data` | Update freq/mode/power display, feed UpdateWorker |
+| `_on_slices_changed(str)` | `FlexRadioClient.slices_changed` | Rebuild slice combo |
+| `_on_wl_status(bool, str)` | `UpdateWorker.wavelog_status` | Wavelog badge colour / text |
+| `_on_reconnect_request(str, int)` | `FlexReconnectManager.request_connect` | Trigger `_connect_to()` |
+
+**Tray availability (PLAT 4):** `QSystemTrayIcon.isSystemTrayAvailable()` is checked at startup. When `False` (Linux without notification daemon), `_tray` and `_tray_status` are set to `None`, all accesses are guarded, and `closeEvent` exits normally instead of hiding to tray.
 
 ---
 
-## Konfigurationsdatei
+## Configuration File
 
-Gespeichert unter `%APPDATA%\FlexWavelogBridge\config.json`:
+Stored as `config.json` **in the same directory as `flex_wavelog_bridge.py`** (cross-platform, no OS-specific paths):
 
 ```json
 {
-  "wavelog_url":     "https://log.example.com",
-  "wavelog_api_key": "abc123...",
-  "radio_name":      "FlexRadio 6600",
-  "update_interval": 5,
-  "flex_host":       "192.168.1.100",
-  "flex_port":       4992,
-  "auto_connect":    false
+  "wavelog_url":          "https://log.example.com",
+  "wavelog_api_key":      "abc123...",
+  "radio_name":           "FlexRadio 6600",
+  "update_interval":      5,
+  "flex_host":            "192.168.1.100",
+  "flex_port":            4992,
+  "auto_connect":         false,
+  "flex_reconnect":       true,
+  "flex_reconnect_sec":   15,
+  "last_flex_ip":         "192.168.1.100",
+  "client_handle_filter": true
 }
 ```
 
----
-
-## Bekannte Einschränkungen
-
-- **Nur Windows:** `pythonw.exe`-Erkennung und WinError-Codes sind Windows-spezifisch. Unter Linux/macOS würde `pythonw` fehlen und `errno.EBADF` (9) statt WinError 10038 auftreten (im `_CLOSED_ERRNOS`-Set bereits enthalten).
-- **UDP-Port 4992:** Wenn SmartSDR bereits auf dem gleichen Rechner läuft, kann der Discovery-Port belegt sein. In diesem Fall muss die IP manuell eingegeben werden. `SO_REUSEADDR` sollte helfen, ist aber nicht auf allen Windows-Versionen ausreichend.
-- **Nur ein FlexRadio:** Es kann immer nur eine TCP-Verbindung gleichzeitig aktiv sein. Mehrere Radios werden bei der Discovery erkannt, aber nur eines kann aktiv sein.
-- **Kein Reconnect:** Bei Verbindungsverlust muss manuell neu verbunden werden. Auto-Reconnect ist nicht implementiert.
+`config.json` and `bridge.log` are always resolved relative to `Path(__file__).resolve().parent` — they appear next to the script regardless of the working directory or OS.
 
 ---
 
-## Abhängigkeiten
+## Platform Notes
 
-| Paket | Version | Zweck |
-|---|---|---|
-| `PyQt6` | >=6.4.0 | GUI, Threading, Signals |
-| `requests` | >=2.28.0 | HTTP-Client für Wavelog-API |
-
-Python-Stdlib (keine Installation nötig): `socket`, `struct`, `threading`, `json`, `logging`, `datetime`, `time`, `pathlib`, `os`, `sys`
+| Concern | Solution |
+|---------|----------|
+| Config / log path | `Path(__file__).resolve().parent` — no `APPDATA`, no `~/.config` |
+| Socket error codes | `errno.EBADF/ECONNRESET/ECONNABORTED/ENOTSOCK` + optional `winerror` guard |
+| UDP socket options | `SO_REUSEPORT` preferred; `AttributeError` fallback to `SO_REUSEADDR` |
+| System tray | `isSystemTrayAvailable()` check; graceful fallback when absent |
+| UI fonts | `'Segoe UI','SF Pro Text','Helvetica Neue','Liberation Sans',sans-serif` |
+| Monospace font | `'Consolas','Menlo','DejaVu Sans Mono','Courier New',monospace` |
+| No-window launch | `pythonw.exe` (Windows); `sys.stdout is None` guard for `StreamHandler` |
 
 ---
 
-## Entwicklungshinweise
+## Developer How-Tos
 
-### Neuen Modus hinzufügen
+### Add a new mode mapping
 
-In `FlexRadioClient.MODE_MAP` eintragen:
+Edit `FlexRadioClient.MODE_MAP`:
+
 ```python
 MODE_MAP = {
     ...
-    "NEUER_MODE": "ADIF_EQUIVALENT",
+    "NEW_MODE": "ADIF_EQUIVALENT",
 }
 ```
 
-### Weitere Slice-Keys auswerten
+### Parse an additional slice key
 
-In `FlexRadioClient._update_slice()` im `for kv in update.split()`-Block ergänzen:
+In `FlexRadioClient._update_slice()`, add a branch inside the `for kv in update.split()` loop:
+
 ```python
-elif k == "neuer_key":
-    s["neuer_key"] = val
-    changed = True
+elif k == "new_key":
+    if s.get("new_key") != val:
+        s["new_key"] = val
+        changed = True
 ```
 
-### Weitere Wavelog-API-Felder senden
+Then include the field in `_emit_active_slice_data()` JSON payload and `UpdateWorker.run()` / `WavelogClient.send_radio_data()`.
 
-In `WavelogClient.send_radio_data()` das `payload`-Dict erweitern, z.B. für Sendeleistung:
+### Send an additional Wavelog field
+
+In `WavelogClient.send_radio_data()`, extend the `payload` dict:
+
 ```python
 payload = {
     ...
-    "power": s.get("rf_power", ""),
+    "new_field": value,
 }
 ```
 
-### Logging-Level anpassen
+### Adjust logging level
 
-In `flex_wavelog_bridge.py` Zeile ~30:
+Line ~46 in the file:
+
 ```python
-logging.basicConfig(level=logging.DEBUG, ...)  # DEBUG, INFO, WARNING
+logging.basicConfig(level=logging.DEBUG, ...)  # DEBUG | INFO | WARNING
 ```
+
+### Add a new subscription
+
+Append to the init command list in `FlexRadioClient.run()`:
+
+```python
+for cmd in (...,
+            "sub new_topic all"):
+    self._cmd(cmd)
+```
+
+Then add a new `elif topic == "new_topic":` branch in `_parse_status`.
+
+---
+
+## Dependencies
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `PyQt6` | ≥ 6.4.0 | GUI, threading, signals |
+| `requests` | ≥ 2.28.0 | HTTP client for Wavelog API |
+
+Standard library (no installation needed): `socket`, `struct`, `threading`, `json`, `logging`, `datetime`, `time`, `pathlib`, `os`, `sys`, `errno`
 
 ---
 
 ## Changelog
 
-### Version aktuell (FlexLib 4.1.5)
+### v3.0 (2026) — AetherSDR & Cross-Platform
 
-- Discovery: Binäres VITA-49-Protokoll korrekt implementiert (statt Klartext-UDP)
-- Frequenz-Key: `rf_frequency` (lowercase, korrekt per Slice.cs)
-- TX-Slice-Tracking: `tx=0/1` aus Slice-Status-Updates
-- Manuelle Slice-Auswahl: unabhängig vom TX-Status
-- Alle Signale als JSON-String (`pyqtSignal(str)`) statt `pyqtSignal(dict)`
-- `sys.stdout`-Guard für `pythonw.exe`
-- Atomarer Socket-Tausch verhindert WinError 10038
-- Wavelog-Test unabhängig von FlexRadio-Verbindung (eigener `QThread`)
-- TCP-Init-Sequenz vollständig (inkl. `client program`, `client start_persistence off`)
+- `keepalive enable` added to init sequence (AetherSDR compatibility, harmless on SmartSDR)
+- `client gui` + `client station` registration for proper multi-client announcement
+- `client_handle` filtering in `_parse_status` — tracks only owned slices when multiple SDR clients are connected; controlled by `client_handle_filter` config key and GUI checkbox
+- `_own_handle`, `_owned_slice_ids`, `filter_by_handle` fields added to `FlexRadioClient`
+- `FDVU` / `FDVM` added to `MODE_MAP` (AetherSDR FreeDV modes → DIGI)
+- Cross-platform path handling: `Path(__file__).resolve().parent` replaces `APPDATA`
+- Portable socket error codes via `errno` module + optional `winerror` guard
+- `SO_REUSEPORT` / `SO_REUSEADDR` fallback for UDP socket
+- `QSystemTrayIcon.isSystemTrayAvailable()` check with graceful fallback
+- Cross-platform font stacks for UI and monospace log window
+- Window title updated to show "SmartSDR & AetherSDR"
+
+### v2.0 (2026)
+
+- Bugfix: `UpdateWorker.clear_radio_data()` called on disconnect — stops stale Wavelog sends
+- Last-used radio IP stored in config; pre-selected in Discovery dialog
+- `FlexReconnectManager` thread — automatic reconnect with configurable interval
+- Wavelog failure counter — periodic warnings instead of per-attempt spam
+- Quit button in header and tray menu — fully terminates the process
+- TX power: `rfpower` from `sub transmit all` forwarded to Wavelog as `power`
+
+### v1.0 (2025)
+
+- Initial release: VITA-49 discovery, SmartSDR TCP API, slice tracking, Wavelog API, system tray, PyQt6 GUI
